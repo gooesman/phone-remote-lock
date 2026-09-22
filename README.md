@@ -72,8 +72,8 @@
 输出会分成两行，注意**配对端口和连接端口是两个不同的端口**：
 
 ```
-  [连接] adb connect 192.168.31.152:42007
-  [配对] adb pair 192.168.31.152:44667 <6位配对码>
+  [连接] adb connect 192.168.1.23:42007
+  [配对] adb pair 192.168.1.23:44667 <6位配对码>
 ```
 
 `[配对]` 只在手机上打开「使用配对码配对设备」弹窗时才会出现（弹窗一关端口就失效）。
@@ -81,7 +81,7 @@
 然后：
 
 ```
-.venv\Scripts\python.exe lock_phone.py pair 192.168.31.152:44667 771748
+.venv\Scripts\python.exe lock_phone.py pair 192.168.1.23:44667 123456
 ```
 
 配对成功后工具会记住设备，之后自动连接，并用 mDNS 自动跟踪端口变化。
@@ -100,7 +100,7 @@
 也可以手动指定新地址：
 
 ```
-D:\adb\platform-tools\adb.exe connect 192.168.31.152:42007
+D:\adb\platform-tools\adb.exe connect 192.168.1.23:42007
 ```
 
 或直接改 `config.json` 里的 `device` 字段。

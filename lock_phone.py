@@ -224,9 +224,9 @@ def single_instance(name="phone_remote_lock_tray"):
 # ---------------------------------------------------------------- adb
 
 ADB_CANDIDATES = [
-    r"D:\adb\platform-tools\adb.exe",
     r"C:\platform-tools\adb.exe",
     r"C:\Program Files\platform-tools\adb.exe",
+    r"D:\adb\platform-tools\adb.exe",
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk", "platform-tools", "adb.exe"),
     os.path.join(os.environ.get("USERPROFILE", ""), "scoop", "apps", "adb", "current", "adb.exe"),
     os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Microsoft", "WinGet", "Links", "adb.exe"),

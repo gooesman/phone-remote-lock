@@ -25,6 +25,7 @@
   "panel_poll_seconds": 8,
   "overlay_alpha": 0.55,
   "overlay_margin": 0.06,
+  "overlay_pointer": true,
   "command_timeout": 12,
   "auto_discover": true,
   "allow_kill_server": true,

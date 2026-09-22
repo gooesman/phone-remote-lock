@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-overlay.py —— 全黑半透明「鼠标映射层」（Qt 版）
+overlay.py —— 黑色半透明「鼠标映射层」窗口（Qt 版）
 
 把电脑鼠标映射成手机的触摸操作，不用低头看手机也能操作：
 
@@ -14,14 +14,21 @@ overlay.py —— 全黑半透明「鼠标映射层」（Qt 版）
     空格              -> 播放 / 暂停
     L / W             -> 锁屏 / 唤醒
     N                 -> 通知栏
+    P                 -> 手机端指针显示 开/关
     S                 -> 刷新状态（含亮度窗口覆盖提示）
     R                 -> 重新读取分辨率（手机转过屏后用）
+    F11               -> 全屏 / 窗口 切换
     Esc               -> 退出
 
 直接运行：python overlay.py      或双击 overlay.bat
 
-窗口整体是「黑色 + 可调不透明度」（config.json 的 overlay_alpha），
-中间那块竖向矩形是手机屏幕的等比例映射区，鼠标只有落在里面才会作用到手机。
+窗口是一个可拖动、可缩放的置顶小窗（黑色 + 可调不透明度 overlay_alpha），
+不会再一打开就把整个屏幕遮黑；中间矩形是手机屏幕的等比例映射区，
+鼠标只有落在里面才会作用到手机。
+
+手机上会同步显示「触摸落点圆点 + 指针十字线」（开发者选项的
+show_touches / pointer_location），方便看清点在哪；映射层退出时
+自动还原这两项设置。不想要可以在 config.json 里把 overlay_pointer 关掉。
 """
 
 import os
@@ -56,8 +63,9 @@ C_BAD = QColor(255, 143, 143)
 
 HINTS = [
     "左键单击 = 点按      左键拖动 = 滑动      滚轮 = 上/下一个视频",
-    "右键 = 返回     中键 = 桌面     ↑↓ = 音量     ←→ = 亮度     空格 = 播放/暂停",
-    "L = 锁屏    W = 唤醒    N = 通知栏    S = 状态    R = 重读分辨率    Esc = 退出",
+    "右键 = 返回    中键 = 桌面    ↑↓ = 音量    ←→ = 亮度    空格 = 播放/暂停",
+    "L = 锁屏   W = 唤醒   N = 通知栏   P = 手机指针   S = 状态   R = 重读分辨率",
+    "F11 = 全屏/窗口切换    Esc = 退出",
 ]
 
 
@@ -85,8 +93,15 @@ class Overlay(QWidget):
 
         self._bg = None
 
-        self.setWindowTitle("mouse mapping overlay")
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # 手机端指针显示：None = 还没碰过设置，(show_touches, pointer_location) = 打开前的原值
+        self._pointer_prev = None
+        self._pointer_on = False
+
+        self.setWindowTitle("手机映射层")
+        # 普通置顶窗口：带标题栏可拖动 / 缩放 / 最小化，不再全屏遮黑
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint
+                            | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
+        self.setMinimumSize(320, 480)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         try:
@@ -213,11 +228,16 @@ class Overlay(QWidget):
 
         if self.mouse_pos:
             x, y = self.mouse_pos
+            point = self.to_phone(x, y)
+            if point:
+                # 贯穿映射区的十字准线，方便瞄准
+                painter.setPen(QPen(C_CURSOR, 1, Qt.DashLine))
+                painter.drawLine(self.fx0, y, self.fx1, y)
+                painter.drawLine(x, self.fy0, x, self.fy1)
             painter.setPen(QPen(C_CURSOR, 2))
             painter.drawEllipse(QRectF(x - 9, y - 9, 18, 18))
             painter.setPen(C_CURSOR)
             painter.setFont(self._font(8))
-            point = self.to_phone(x, y)
             painter.drawText(x + 13, y + 16, "%s,%s" % point if point else "")
         painter.end()
 
@@ -293,8 +313,56 @@ class Overlay(QWidget):
             self._enqueue("__state__")
         elif key == Qt.Key_R:
             self._enqueue("__size__")
+        elif key == Qt.Key_P:
+            self._enqueue("__pointer__")
+        elif key == Qt.Key_F11:
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
         else:
             super().keyPressEvent(event)
+
+    # ---------------------------------------------------------- 手机端指针显示
+
+    def _pointer_setup(self):
+        """worker 线程调用：开启手机端指针显示，并记住原值以便退出时还原。"""
+        if not self.cfg.get("overlay_pointer", True):
+            self._pointer_on = False
+            return "手机指针显示已在 config.json 关闭（overlay_pointer=false）"
+        try:
+            prev = self.ctl.adb.pointer_aids_state()
+            if self._pointer_prev is None:
+                self._pointer_prev = prev
+            ok, msg = self.ctl.adb.set_pointer_aids(1, 1)
+            self._pointer_on = bool(ok)
+            if ok:
+                return "已开启手机指针显示（触摸圆点 + 十字线）"
+            return "开启手机指针显示失败: %s" % (msg or "未知错误")
+        except Exception as exc:
+            return "开启手机指针显示异常: %s" % exc
+
+    def _pointer_restore(self):
+        """还原打开映射层之前的指针显示设置。"""
+        if self._pointer_prev is None:
+            return
+        try:
+            show, loc = self._pointer_prev
+            self.ctl.adb.set_pointer_aids(
+                show if show is not None else 0,
+                loc if loc is not None else 0)
+        except Exception as exc:
+            log("[overlay] 还原手机指针显示失败: %s" % exc)
+        self._pointer_prev = None
+        self._pointer_on = False
+
+    def _pointer_restore_blocking(self, timeout=4.0):
+        """退出时同步还原（worker 是 daemon 线程，进程退出前必须等它做完）。"""
+        if self._pointer_prev is None:
+            return
+        thread = threading.Thread(target=self._pointer_restore)
+        thread.start()
+        thread.join(timeout=timeout)
 
     # ---------------------------------------------------------- 任务队列
 
@@ -321,6 +389,13 @@ class Overlay(QWidget):
                         info += "  ⚠ %s 占用窗口亮度覆盖" % override
                 self.result_box[0] = (ok, info)
                 continue
+            if action == "__pointer__":
+                if self._pointer_on:
+                    self._pointer_restore()
+                    self.result_box[0] = (True, "已关闭手机指针显示")
+                else:
+                    self.result_box[0] = (True, self._pointer_setup())
+                continue
             try:
                 ok, info = self.ctl.run_action(action, **kwargs)
                 if action == "connect":
@@ -328,6 +403,7 @@ class Overlay(QWidget):
                     if ok:
                         self._read_size()
                         self.need_layout = True
+                        info += " · " + self._pointer_setup()
             except Exception as exc:
                 ok, info = False, "异常: %s" % exc
             log("[overlay] %s: %s %s" % (action, "OK" if ok else "FAIL", info))
@@ -355,10 +431,12 @@ class Overlay(QWidget):
 
     def _quit(self):
         self.timer.stop()
+        self._pointer_restore_blocking()
         QApplication.quit()
 
     def closeEvent(self, event):
         self.timer.stop()
+        self._pointer_restore_blocking()
         super().closeEvent(event)
 
 
@@ -366,7 +444,17 @@ def main():
     cfg = load_config()
     app = QApplication(sys.argv)
     overlay = Overlay(cfg)
-    overlay.showFullScreen()
+
+    # 单个置顶小窗：高度约为屏幕可用高度的 82%，宽度按手机长宽比推算，居中显示
+    screen = app.primaryScreen().availableGeometry()
+    height = min(int(screen.height() * 0.82), 980)
+    width = int(height * overlay.pw / float(overlay.ph)) + 24
+    width = max(360, min(width, screen.width() - 80))
+    overlay.resize(width, height)
+    overlay.move(screen.x() + (screen.width() - width) // 2,
+                 screen.y() + (screen.height() - height) // 2)
+
+    overlay.show()
     overlay.activateWindow()
     overlay.raise_()
     overlay.setFocus()

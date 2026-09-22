@@ -136,6 +136,7 @@ def default_config():
         "panel_poll_seconds": 8,
         "overlay_alpha": 0.55,
         "overlay_margin": 0.06,
+        "overlay_pointer": True,
         "command_timeout": 12,
         "auto_discover": True,
         "allow_kill_server": True,
@@ -559,6 +560,32 @@ class Adb(object):
                                    self.cfg.get("brightness_key_repeat", 1))
 
     # -- 状态 ------------------------------------------------------
+
+    def pointer_aids_state(self):
+        """读取开发者选项里的指针显示设置。
+
+        返回 (show_touches, pointer_location)，各项为 0/1，读不到为 None。
+        """
+        def one(key):
+            code, out = self._shell(["settings", "get", "system", key], timeout=6)
+            if code != 0:
+                return None
+            out = (out or "").strip()
+            return int(out) if out in ("0", "1") else None
+        return one("show_touches"), one("pointer_location")
+
+    def set_pointer_aids(self, show_touches=None, pointer_location=None):
+        """开关「显示触摸操作」/「指针位置」，传 None 的项不动。"""
+        ok, msg = True, ""
+        for key, val in (("show_touches", show_touches),
+                         ("pointer_location", pointer_location)):
+            if val is None:
+                continue
+            code, out = self._shell(["settings", "put", "system", key, str(int(val))],
+                                    timeout=6)
+            if code != 0:
+                ok, msg = False, (out or "").strip()
+        return ok, msg
 
     def screen_state(self):
         code, out = self._shell(["dumpsys", "power"], timeout=15)

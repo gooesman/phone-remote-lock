@@ -1,0 +1,33 @@
+{
+  "adb_path": "",
+  "device": "",
+  "actions": {
+    "<ctrl>+<alt>+l": "lock",
+    "<ctrl>+<alt>+<up>": "vol-up",
+    "<ctrl>+<alt>+<down>": "vol-down",
+    "<ctrl>+<alt>+m": "mute",
+    "<ctrl>+<alt>+<right>": "bright-up",
+    "<ctrl>+<alt>+<left>": "bright-down",
+    "<ctrl>+<alt>+<page_down>": "next",
+    "<ctrl>+<alt>+<page_up>": "prev",
+    "<ctrl>+<alt>+<space>": "play-pause",
+    "<ctrl>+<alt>+o": "overlay-toggle",
+    "<ctrl>+<alt>+p": "panel"
+  },
+  "lock_keyevent": 223,
+  "wake_keyevent": 224,
+  "brightness_disable_auto": true,
+  "brightness_key_repeat": 1,
+  "warn_window_override": true,
+  "swipe_duration": 160,
+  "left_click": "both",
+  "panel_port": 59731,
+  "panel_poll_seconds": 8,
+  "overlay_alpha": 0.55,
+  "overlay_margin": 0.06,
+  "command_timeout": 12,
+  "auto_discover": true,
+  "allow_kill_server": true,
+  "retry_cooldown": 4.0,
+  "notify": true
+}

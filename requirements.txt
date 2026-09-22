@@ -1,0 +1,4 @@
+pynput>=1.7.6
+pystray>=0.19.5
+Pillow>=10.0.0
+PySide6>=6.6.0

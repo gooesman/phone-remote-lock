@@ -1,0 +1,5 @@
+# 仓库里统一用 LF，但 Windows 脚本必须是 CRLF
+* text=auto eol=lf
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.png binary

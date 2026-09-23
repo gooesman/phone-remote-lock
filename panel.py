@@ -23,20 +23,24 @@ panel.py —— 控制面板 + 鼠标映射层宿主（Qt）
 
 import os
 import queue
+import re
 import socket
 import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lock_phone import Controller, load_config, log  # noqa: E402
+from lock_phone import (  # noqa: E402
+    Controller, default_config, load_config, log, save_config, tray_running,
+)
 
 try:
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import QFont, QKeySequence
     from PySide6.QtWidgets import (
-        QApplication, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QPushButton,
-        QVBoxLayout, QWidget,
+        QApplication, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout,
+        QHeaderView, QInputDialog, QKeySequenceEdit, QLabel, QLineEdit,
+        QMessageBox, QPushButton, QTableWidget, QVBoxLayout, QWidget,
     )
 except ImportError as exc:  # pragma: no cover
     sys.stderr.write("缺少 PySide6：.venv\\Scripts\\python.exe -m pip install PySide6\n%s\n" % exc)
@@ -86,7 +90,242 @@ QPushButton:hover { background: #2d3138; }
 QPushButton:pressed { background: #3b4049; }
 QPushButton:checked { background: #2f6b4f; border-color: #47936c; color: #eafff4; }
 QPushButton#wide { min-height: 30px; }
+QPushButton#gear { min-height: 26px; max-width: 76px; padding: 4px 10px; }
+QTableWidget { background: #1b1e23; border: 1px solid #34383f; border-radius: 6px; }
+QTableWidget::item { padding: 4px; }
+QComboBox, QKeySequenceEdit, QLineEdit { background: #23262c; border: 1px solid #34383f;
+                                         border-radius: 5px; padding: 3px 6px; }
+QHeaderView::section { background: #23262c; border: none; padding: 5px; color: #9aa0a8; }
 """
+
+# 可绑定热键的功能（值要和 lock_phone.Controller.run_action 的动作名一致）
+HOTKEY_ACTIONS = [
+    ("lock", "锁定手机"),
+    ("wake", "唤醒屏幕"),
+    ("vol-up", "音量 +"),
+    ("vol-down", "音量 -"),
+    ("mute", "静音"),
+    ("bright-up", "亮度 +"),
+    ("bright-down", "亮度 -"),
+    ("bright-get", "查看当前亮度"),
+    ("next", "下一个视频"),
+    ("prev", "上一个视频"),
+    ("play-pause", "播放 / 暂停"),
+    ("home", "回到桌面"),
+    ("back", "返回键"),
+    ("app-switch", "任务切换"),
+    ("overlay-toggle", "切换映射层"),
+    ("overlay-on", "开启映射层"),
+    ("overlay-off", "关闭映射层"),
+    ("panel", "打开控制面板"),
+    ("connect", "重新连接手机"),
+]
+
+# Qt 的按键名 -> pynput 的写法
+QT2PY = {
+    "Ctrl": "<ctrl>", "Control": "<ctrl>", "Alt": "<alt>", "Shift": "<shift>",
+    "Meta": "<cmd>", "Win": "<cmd>", "PgUp": "<page_up>", "PgDown": "<page_down>",
+    "Space": "<space>", "Up": "<up>", "Down": "<down>", "Left": "<left>",
+    "Right": "<right>", "Ins": "<insert>", "Insert": "<insert>", "Del": "<delete>",
+    "Delete": "<delete>", "Home": "<home>", "End": "<end>", "Backspace": "<backspace>",
+    "Return": "<enter>", "Enter": "<enter>", "Tab": "<tab>", "Esc": "<esc>",
+    "Escape": "<esc>", "CapsLock": "<caps_lock>", "PrtSc": "<print_screen>",
+    "Num+": "<num_add>", "Num-": "<num_subtract>", "Num*": "<num_multiply>",
+    "Num/": "<num_divide>", "Num.": "<num_decimal>", "Num0": "<num_0>",
+}
+PY2QT = {value: key for key, value in QT2PY.items()}
+PY2QT["<ctrl>"] = "Ctrl"
+
+
+def qt_to_pynput(text):
+    """把 Qt 的 "Ctrl+Alt+L" 转成 pynput 的 "<ctrl>+<alt>+l"。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    parts = []
+    for token in text.split("+"):
+        token = token.strip()
+        if not token:
+            continue
+        if token in QT2PY:
+            parts.append(QT2PY[token])
+        elif re.fullmatch(r"[Ff]\d{1,2}", token):
+            parts.append("<%s>" % token.lower())
+        elif len(token) == 1:
+            parts.append(token.lower())
+        else:
+            parts.append("<%s>" % token.lower())
+    return "+".join(parts)
+
+
+def pynput_to_qt(hotkey):
+    """反向转换，用于把已有配置显示回界面。"""
+    hotkey = (hotkey or "").strip()
+    if not hotkey:
+        return ""
+    parts = []
+    for token in hotkey.split("+"):
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith("<") and token.endswith(">"):
+            parts.append(PY2QT.get(token, token.strip("<>")))
+        else:
+            parts.append(token.upper())
+    return "+".join(parts)
+
+
+def has_modifier(hotkey):
+    return any(tag in (hotkey or "") for tag in ("<ctrl>", "<alt>", "<shift>", "<cmd>"))
+
+
+class SettingsDialog(QDialog):
+    """设置窗口：给控制面板的功能绑定全局快捷键。"""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle("设置 · 快捷键绑定")
+        self.setMinimumWidth(560)
+
+        root = QVBoxLayout(self)
+        tip = QLabel("给下面的功能绑定全局快捷键（在哪都能按）。快捷键由托盘程序注册，"
+                     "保存后约 2 秒自动生效，不用重启。")
+        tip.setObjectName("dim")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["功能", "快捷键（点这一格后直接按键）", "操作"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        self.table.setColumnWidth(1, 210)
+        self.table.setColumnWidth(2, 64)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(300)
+        root.addWidget(self.table)
+
+        row = QHBoxLayout()
+        add = QPushButton("添加绑定")
+        add.clicked.connect(lambda: self._add_row())
+        row.addWidget(add)
+        reset = QPushButton("恢复默认")
+        reset.clicked.connect(self._reset_default)
+        row.addWidget(reset)
+        row.addStretch(1)
+        root.addLayout(row)
+
+        self.hint = QLabel(self._tray_hint())
+        self.hint.setObjectName("dim")
+        self.hint.setWordWrap(True)
+        root.addWidget(self.hint)
+
+        note = QLabel("建议都带 Ctrl / Alt / Shift。单个字母这种没修饰键的会全局抢占键盘，"
+                      "平时打字容易误触发。窗口开着时按 Esc 会关掉设置。")
+        note.setObjectName("dim")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("保存")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        for hotkey, action in (cfg.get("actions") or {}).items():
+            self._add_row(hotkey, action)
+        if self.table.rowCount() == 0:
+            self._add_row()
+
+    # -- 行操作 ------------------------------------------------------
+
+    def _add_row(self, hotkey="", action=""):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        combo = QComboBox()
+        for value, label in HOTKEY_ACTIONS:
+            combo.addItem(label, value)
+        index = combo.findData(action)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        self.table.setCellWidget(row, 0, combo)
+
+        editor = QKeySequenceEdit()
+        if hotkey:
+            editor.setKeySequence(QKeySequence(pynput_to_qt(hotkey)))
+        self.table.setCellWidget(row, 1, editor)
+
+        remove = QPushButton("删除")
+        remove.clicked.connect(lambda _=False, btn=remove: self._remove_row(btn))
+        self.table.setCellWidget(row, 2, remove)
+
+    def _remove_row(self, button):
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, 2) is button:
+                self.table.removeRow(row)
+                return
+
+    def _reset_default(self):
+        while self.table.rowCount():
+            self.table.removeRow(0)
+        for hotkey, action in default_config()["actions"].items():
+            self._add_row(hotkey, action)
+
+    def _tray_hint(self):
+        if tray_running():
+            return "托盘程序正在运行，保存后会立刻重载快捷键。"
+        return ("⚠ 托盘程序没在运行：设置会保存进 config.json，但要等 start.bat 启动托盘后才生效。")
+
+    # -- 保存 --------------------------------------------------------
+
+    def _save(self):
+        actions = {}
+        for row in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row, 0)
+            editor = self.table.cellWidget(row, 1)
+            text = editor.keySequence().toString() if editor else ""
+            if not text:
+                continue  # 空着 = 不绑定
+            hotkey = qt_to_pynput(text)
+            action = combo.currentData()
+            if not hotkey:
+                QMessageBox.warning(self, "设置", "第 %d 行的快捷键没识别出来：%s" % (row + 1, text))
+                return
+            if hotkey in actions:
+                QMessageBox.warning(self, "设置", "快捷键 %s 重复了（第 %d 行），请改掉一个。"
+                                    % (text, row + 1))
+                return
+            if not has_modifier(hotkey) and not re.fullmatch(r"<f\d{1,2}>", hotkey):
+                answer = QMessageBox.question(
+                    self, "设置",
+                    "%s 没有 Ctrl / Alt / Shift 修饰键，会在任何程序里抢占键盘。\n确定要用吗？"
+                    % text,
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
+            actions[hotkey] = action
+
+        old = self.cfg.get("actions") or {}
+        if not actions and old:
+            answer = QMessageBox.question(
+                self, "设置", "一个快捷键都没留，等于关掉全部热键（托盘菜单仍可用）。确定吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+
+        self.cfg["actions"] = actions
+        try:
+            save_config(self.cfg)
+        except Exception as exc:
+            QMessageBox.critical(self, "设置", "写入 config.json 失败：%s" % exc)
+            return
+        self.saved_count = len(actions)
+        log("[settings] 已保存 %s 个快捷键: %s" % (len(actions), sorted(actions.values())))
+        self.accept()
 
 
 def send_command(port, command, timeout=1.5):
@@ -182,6 +421,17 @@ class ControlPanel(QWidget):
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(8)
 
+        # 左上角：设置按钮
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        gear = QPushButton("⚙ 设置")
+        gear.setObjectName("gear")
+        gear.setToolTip("设置全局快捷键绑定")
+        gear.clicked.connect(self._open_settings)
+        top.addWidget(gear)
+        top.addStretch(1)
+        root.addLayout(top)
+
         title = QLabel("手机遥控")
         title.setObjectName("title")
         root.addWidget(title)
@@ -244,6 +494,16 @@ class ControlPanel(QWidget):
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+    def _open_settings(self):
+        """左上角「设置」：改快捷键绑定，保存后托盘自动重载。"""
+        dialog = SettingsDialog(self.host.cfg, self)
+        if dialog.exec() == QDialog.Accepted:
+            count = getattr(dialog, "saved_count", 0)
+            if tray_running():
+                self.set_status("已保存 %s 个快捷键，托盘正在重载（约 2 秒生效）" % count)
+            else:
+                self.set_status("已保存 %s 个快捷键。托盘未运行，需先启动 start.bat 才生效" % count)
 
     def _ask_addr(self):
         """弹出输入框，手动填手机 IP:端口 后连接。"""

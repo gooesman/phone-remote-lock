@@ -224,6 +224,29 @@ def single_instance(name="phone_remote_lock_tray"):
         return True
 
 
+def tray_running(name="phone_remote_lock_tray"):
+    """托盘程序是否已经在跑（用于提示「快捷键要不要先启动托盘」）。"""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.OpenMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        SYNCHRONIZE = 0x00100000
+        handle = kernel32.OpenMutexW(SYNCHRONIZE, False, name)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------- adb
 
 ADB_CANDIDATES = [
@@ -740,6 +763,50 @@ class TrayApp(object):
         self.ctl = Controller(cfg)
         self.icon = None
         self._busy = threading.Lock()
+        self.hotkeys = None
+        self._cfg_mtime = 0.0
+
+    # -- 配置热重载 --------------------------------------------------
+
+    def _config_mtime(self):
+        try:
+            return os.path.getmtime(CONFIG_PATH)
+        except OSError:
+            return 0.0
+
+    def _watch_config(self):
+        """盯着 config.json：在控制面板里改完快捷键后自动重载，不用重启托盘。"""
+        while True:
+            time.sleep(2.0)
+            mtime = self._config_mtime()
+            if mtime and mtime != self._cfg_mtime:
+                self._cfg_mtime = mtime
+                self._reload_config()
+
+    def _reload_config(self):
+        try:
+            new_cfg = load_config()
+        except Exception as exc:
+            log("[config] 重新读取失败: %s" % exc)
+            return
+        self.cfg = new_cfg
+        self.ctl = Controller(new_cfg)
+        if self.hotkeys is not None:
+            try:
+                self.hotkeys.stop()
+            except Exception:
+                pass
+            self.hotkeys = None
+        self.hotkeys = self.start_hotkeys()
+        try:
+            if self.icon is not None:
+                self.icon.menu = self._menu()
+                self.icon.update_menu()
+        except Exception as exc:
+            log("[config] 刷新托盘菜单失败: %s" % exc)
+        count = len(new_cfg.get("actions") or {})
+        log("配置已变更：已重载 %s 个热键" % count)
+        self._notify("已重载 %s 个快捷键" % count, "设置已生效")
 
     def _image(self, color):
         from PIL import Image, ImageDraw
@@ -908,7 +975,9 @@ class TrayApp(object):
             have_tray = False
             log("托盘不可用（%s），进入纯热键模式" % exc)
 
-        self.start_hotkeys()
+        self._cfg_mtime = self._config_mtime()
+        threading.Thread(target=self._watch_config, daemon=True).start()
+        self.hotkeys = self.start_hotkeys()
         self._fire("connect", "无线 adb")
 
         if have_tray:

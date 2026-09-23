@@ -46,6 +46,7 @@ echo.
 echo Setup complete.
 echo   start.bat       - run in the system tray (hotkeys enabled)
 echo   restart.bat     - kill old processes and restart the tray
+echo   connect.bat     - connect the phone by typing IP:port
 echo   panel.bat       - open the control panel
 echo   overlay.bat     - open the mouse mapping overlay
 echo   remote.bat      - text menu remote

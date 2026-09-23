@@ -35,7 +35,8 @@ try:
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QFont
     from PySide6.QtWidgets import (
-        QApplication, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+        QApplication, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QPushButton,
+        QVBoxLayout, QWidget,
     )
 except ImportError as exc:  # pragma: no cover
     sys.stderr.write("缺少 PySide6：.venv\\Scripts\\python.exe -m pip install PySide6\n%s\n" % exc)
@@ -227,6 +228,11 @@ class ControlPanel(QWidget):
         reconnect.setObjectName("wide")
         reconnect.clicked.connect(lambda: self.host.fire("connect"))
         row.addWidget(reconnect)
+
+        manual = QPushButton("输入地址连接")
+        manual.setObjectName("wide")
+        manual.clicked.connect(self._ask_addr)
+        row.addWidget(manual)
         root.addLayout(row)
 
         self.status_label = QLabel("就绪")
@@ -238,6 +244,18 @@ class ControlPanel(QWidget):
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+    def _ask_addr(self):
+        """弹出输入框，手动填手机 IP:端口 后连接。"""
+        saved = (self.host.cfg.get("device") or "").strip()
+        text, ok = QInputDialog.getText(
+            self, "连接手机",
+            "手机 IP:端口（手机上「无线调试」页面显示的那个，例如 192.168.1.23:42007）：",
+            QLineEdit.Normal, saved)
+        text = (text or "").strip()
+        if ok and text:
+            self.set_status("正在连接 %s …" % text)
+            self.host.fire("connect-addr", addr=text)
 
     def set_status(self, text):
         self.status_label.setText(text)
@@ -447,6 +465,16 @@ class PanelHost(object):
                 self.result_box[0] = (True, "面板已就绪", None)
                 continue
 
+            if action == "connect-addr":
+                addr = (kwargs.get("addr") or "").strip()
+                try:
+                    ok, text = self.ctl.adb.connect_addr(addr)
+                except Exception as exc:
+                    ok, text = False, "异常: %s" % exc
+                log("[panel] connect-addr %s: %s %s" % (addr, "OK" if ok else "FAIL", text))
+                self.result_box[0] = (ok, text, None)
+                continue
+
             try:
                 ok, text = self.ctl.run_action(action, **kwargs)
             except Exception as exc:
@@ -454,7 +482,7 @@ class PanelHost(object):
             log("[panel] %s: %s %s" % (action, "OK" if ok else "FAIL", text))
 
             info = None
-            if action in ("bright-up", "bright-down", "bright", "connect"):
+            if action in ("bright-up", "bright-down", "bright", "connect", "connect-addr"):
                 try:
                     ok2, setting, override = self._state_info()
                     if ok2:

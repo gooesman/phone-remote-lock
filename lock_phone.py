@@ -29,7 +29,9 @@ phone-remote-lock —— 把手机变成电脑的「遥控对象」：锁屏 / �
     python lock_phone.py swipe 540 2200 540 700 160
     python lock_phone.py key 26              发送任意 keycode
     python lock_phone.py status               查看连接 / 屏幕 / 亮度
-    python lock_phone.py connect | discover
+    python lock_phone.py connect              引导式输入 IP:端口 连接手机（双击 connect.bat）
+    python lock_phone.py connect IP:PORT      直接连这个地址并记住
+    python lock_phone.py discover             列出 mDNS 发现到的连接/配对端口
     python lock_phone.py pair IP:PORT CODE    首次配对无线调试
 """
 
@@ -402,6 +404,54 @@ class Adb(object):
         self.target = addr
         self.cfg["device"] = addr
         save_config(self.cfg)
+
+    def connect_addr(self, addr):
+        """连接指定的 IP:端口（手动输入用），成功后写入 config.json。"""
+        addr = (addr or "").strip()
+        if not addr:
+            return False, "地址为空"
+        if ":" not in addr:
+            return False, "地址格式应为 IP:端口，例如 192.168.1.23:42007"
+
+        self.target = addr
+        prev_target = self.cfg.get("device") or ""
+        self.cfg["device"] = addr
+
+        # 陈旧连接要先断开，否则 adb connect 只会回 "already connected"
+        self._exec(["disconnect", addr], timeout=10)
+        self._connect(addr)
+        if self._wait_online(addr, tries=6, gap=0.7):
+            self._remember(addr)
+            self._last_fail = 0.0
+            self._last_fail_msg = ""
+            return True, "已连接并记住 %s" % addr
+
+        state = self._devices().get(addr)
+
+        # 端口不通时兜底试一次 mDNS 自动发现（无线调试重开后端口会变）
+        if self.cfg.get("auto_discover", True):
+            for cand in self.discover():
+                if cand == addr:
+                    continue
+                self._connect(cand)
+                if self._wait_online(cand):
+                    self._remember(cand)
+                    return True, ("你给的 %s 连不上，但自动发现了 %s，已连接并记住"
+                                  % (addr, cand))
+
+        # 没连上就别把错误地址留在配置里，否则之后每次都先浪费一轮重试
+        self.cfg["device"] = prev_target
+        self.target = prev_target
+
+        if state == "unauthorized":
+            return False, "设备未授权：请解锁手机，在「允许 USB 调试吗？」弹窗里点允许"
+        if state == "offline":
+            return False, ("连上但状态是 offline：请把手机「无线调试」关掉再打开"
+                           "（端口会变），或重新配对一次")
+        return False, ("连不上 %s（端口无响应）。请确认：\n"
+                       "         1) 端口是「无线调试」页面显示的 IP:端口\n"
+                       "         2) 不是「使用配对码配对设备」弹窗里的那个端口\n"
+                       "         3) 手机与本机在同一 Wi-Fi，且无线调试处于开启状态" % addr)
 
     # -- 通用动作 --------------------------------------------------
 
@@ -793,6 +843,7 @@ class TrayApp(object):
             )),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("重新连接", lambda: self._fire("connect", "无线 adb")),
+            pystray.MenuItem("输入 IP:端口 连接手机", _open_connect_console),
             pystray.MenuItem("打开配置文件", lambda: _open(CONFIG_PATH)),
             pystray.MenuItem("打开日志", lambda: _open(LOG_PATH)),
             pystray.Menu.SEPARATOR,
@@ -945,6 +996,21 @@ def _open(path):
         log("打开 %s 失败: %s" % (path, exc))
 
 
+def _open_connect_console():
+    """在新控制台窗口里跑「输入 IP:端口 连接手机」的引导（托盘菜单用）。"""
+    exe = sys.executable or ""
+    if exe.lower().endswith("pythonw.exe"):
+        cand = os.path.join(os.path.dirname(exe), "python.exe")
+        if os.path.exists(cand):
+            exe = cand
+    flags = 0x00000010 if os.name == "nt" else 0  # CREATE_NEW_CONSOLE
+    try:
+        subprocess.Popen([exe, os.path.join(HERE, "lock_phone.py"), "connect"],
+                         cwd=HERE, creationflags=flags)
+    except Exception as exc:
+        log("[connect] 打开连接窗口失败: %s" % exc)
+
+
 # ---------------------------------------------------------------- CLI
 
 def say(message):
@@ -979,8 +1045,121 @@ MENU_ITEMS = [
     ("o", "切换映射层（全黑半透明）", "overlay-toggle"),
     ("k", "打开控制面板", "panel"),
     ("s", "查看连接状态", "status"),
-    ("c", "重新连接", "connect"),
+    ("c", "重新连接（用已保存的地址）", "connect"),
+    ("i", "输入 IP:端口 连接手机", "connect-input"),
 ]
+
+
+def _ask(prompt, default=""):
+    """读取一行输入；EOF / Ctrl+C 返回 None 表示取消。"""
+    try:
+        text = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return text or default
+
+
+def _split_addr(text, fallback):
+    """把用户输入整理成 IP:端口。
+
+    允许三种写法：完整的 192.168.1.23:42007 / 只给端口 42007 / 只给 IP。
+    缺的那一半用 fallback（上次保存的地址）补齐。
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if ":" in text:
+        return text
+    f_ip, _, f_port = (fallback or "").partition(":")
+    if text.isdigit():
+        return "%s:%s" % (f_ip, text) if f_ip else ""
+    return "%s:%s" % (text, f_port) if f_port else ""
+
+
+def interactive_connect(ctl, cfg):
+    """交互式绑定手机：手动输入 IP:端口，连不上还可以用配对码重新配对。"""
+    adb = ctl.adb
+    say("=" * 52)
+    say("   连接手机（无线 adb）")
+    say("=" * 52)
+
+    if not adb.adb:
+        say("FAIL 未找到 adb。请先装 Android Platform Tools，")
+        say("     或在 config.json 的 adb_path 里填 adb.exe 的完整路径。")
+        return 1
+
+    say("   手机端：设置 → 开发者选项 → 无线调试（打开）")
+    say("   页面顶部显示的 IP:端口 就是要填的地址，例如 192.168.1.23:42007")
+    say("   注意：不要填「使用配对码配对设备」弹窗里的那个端口")
+    say("-" * 52)
+
+    saved = (cfg.get("device") or "").strip()
+    guess = ""
+    for _name, service, addr in adb.mdns_services():
+        if service == "_adb-tls-connect._tcp":
+            guess = addr
+            break
+    if guess:
+        say("   自动发现到设备 : %s" % guess)
+    if saved and saved != guess:
+        say("   上次保存的地址 : %s" % saved)
+    say("")
+
+    default = guess or saved
+    text = _ask("   请输入 手机IP:端口%s: "
+                % ("（直接回车用 %s）" % default if default else "（如 192.168.1.23:42007）"))
+    if text is None:
+        say("已取消")
+        return 1
+
+    addr = _split_addr(text or default, saved)
+    if not addr:
+        if not text and not default:
+            say("FAIL 没有输入地址，已取消")
+        else:
+            say("FAIL 地址不完整，请直接填 IP:端口（例如 192.168.1.23:42007）")
+        return 1
+
+    say("")
+    say("   正在连接 %s …" % addr)
+    ok, info = adb.connect_addr(addr)
+    say(("OK   " if ok else "FAIL ") + info)
+    if ok:
+        say("")
+        print_status(ctl)
+        return 0
+
+    say("")
+    answer = _ask("   要用「配对码」重新配对一次吗？[y/N]: ", "n") or "n"
+    if answer.lower() not in ("y", "yes"):
+        say("已取消。修好后可以重跑本脚本，或直接：lock_phone.py connect IP:端口")
+        return 1
+
+    say("   手机上点「使用配对码配对设备」，会显示 配对端口 + 6 位配对码")
+    pair_text = _ask("   配对 IP:端口: ")
+    code = _ask("   6 位配对码: ")
+    if pair_text is None or code is None or not pair_text or not code:
+        say("FAIL 已取消")
+        return 1
+    pair_addr = _split_addr(pair_text, addr)
+    if not pair_addr:
+        say("FAIL 配对地址不完整，已取消")
+        return 1
+
+    say("")
+    say("   正在配对 %s …" % pair_addr)
+    ok, info = adb.pair(pair_addr, code)
+    say(("OK   " if ok else "FAIL ") + info)
+    if not ok:
+        return 1
+
+    ok, info = adb.connect_addr(addr)
+    say(("OK   " if ok else "FAIL ") + info)
+    if ok:
+        say("")
+        print_status(ctl)
+        return 0
+    return 1
 
 
 def print_status(ctl):
@@ -1009,7 +1188,7 @@ def print_status(ctl):
     return True
 
 
-def interactive_menu(ctl):
+def interactive_menu(ctl, cfg):
     """给「双击运行」用的遥控面板。"""
     clear = "cls" if os.name == "nt" else "clear"
     while True:
@@ -1036,8 +1215,10 @@ def interactive_menu(ctl):
                     ok, info = ctl.run_action("key", keycode=int(act.split(":", 1)[1]))
                     say(("OK   " if ok else "FAIL ") + info)
                 elif act == "connect":
-                    ok, info = ctl.adb.ensure()
+                    ok, info = ctl.adb.ensure(force=True)
                     say(("OK   " if ok else "FAIL ") + info)
+                elif act == "connect-input":
+                    interactive_connect(ctl, cfg)
                 else:
                     ok, info = ctl.run_action(act)
                     say(("OK   " if ok else "FAIL ") + info)
@@ -1101,12 +1282,23 @@ def main(argv):
         return 0 if print_status(ctl) else 1
 
     if action == "menu":
-        return interactive_menu(ctl)
+        return interactive_menu(ctl, cfg)
 
     if action == "connect":
-        ok, info = ctl.adb.ensure()
+        # 带地址：connect 192.168.1.23:42007
+        if len(argv) > 2:
+            ok, info = ctl.adb.connect_addr(argv[2])
+            say(("OK   " if ok else "FAIL ") + info)
+            return 0 if ok else 1
+        # 没有地址：能交互就进入引导输入，否则用已保存地址自动重连
+        if sys.stdin and sys.stdin.isatty():
+            return interactive_connect(ctl, cfg)
+        ok, info = ctl.adb.ensure(force=True)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 1
+
+    if action in ("link", "setup-connection", "connect-input"):
+        return interactive_connect(ctl, cfg)
 
     if action == "discover":
         if not ctl.adb.adb:
@@ -1148,7 +1340,7 @@ def main(argv):
         say("未知命令: %s" % action)
         say("可用: lock / wake / vol-up / vol-down / mute / play-pause / next / prev /")
         say("      bright-up / bright-down / bright <值> / swipe / tap / key /")
-        say("      status / connect / discover / pair")
+        say("      status / connect [IP:PORT] / discover / pair")
         return 2
 
     if not single_instance():

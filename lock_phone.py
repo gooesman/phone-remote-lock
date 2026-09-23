@@ -462,15 +462,6 @@ class Adb(object):
                 return int(found.group(1)), int(found.group(2))
         return self.screen_size()
 
-    def rotation(self):
-        """当前旋转角度（0 竖屏 / 90 或 270 横屏）。"""
-        code, out = self._shell(["dumpsys", "window", "displays"], timeout=15)
-        if code == 0 and out:
-            found = re.search(r"\bmRotation=(\d)", out)
-            if found:
-                return int(found.group(1))
-        return None
-
     def swipe_ratio(self, fx1, fy1, fx2, fy2, duration=160):
         ok, info = self.ready()
         if not ok:
@@ -554,10 +545,6 @@ class Adb(object):
         if current is not None:
             msg += "（当前 %s/255）" % current
         return True, msg
-
-    def brightness_step(self, delta):
-        return self.brightness_key(1 if delta > 0 else -1,
-                                   self.cfg.get("brightness_key_repeat", 1))
 
     # -- 状态 ------------------------------------------------------
 
@@ -946,11 +933,6 @@ def _panel(command="panel", cfg=None):
     except Exception as exc:
         log("启动控制面板失败: %s" % exc)
         return False
-
-
-def _launch_overlay():
-    """兼容旧入口：切换映射层。"""
-    return _panel("overlay-toggle")
 
 
 def _open(path):

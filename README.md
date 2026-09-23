@@ -332,5 +332,4 @@ remote.bat           数字菜单遥控面板（纯命令行版）
 lock.bat             锁屏一次（带输出）
 lock_silent.vbs      静默锁屏（可绑定快捷方式热键）
 lock_phone.log       运行日志（已被 .gitignore 排除）
-test-logs/           开发期的诊断输出，可整个删掉
 ```

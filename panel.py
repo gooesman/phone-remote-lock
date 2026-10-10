@@ -49,12 +49,16 @@ except ImportError as exc:  # pragma: no cover
 import overlay as overlay_mod  # noqa: E402
 
 SECTIONS = [
-    ("亮度", [
+    ("亮度 · 系统（退出全屏后生效）", [
         ("减", "bright-down", {}),
         ("加", "bright-up", {}),
         ("10%", "bright", {"value": 26}),
         ("50%", "bright", {"value": 128}),
         ("100%", "bright", {"value": 255}),
+    ]),
+    ("亮度 · 当前 App 全屏（滑动调）", [
+        ("调暗", "app-bright-down", {}),
+        ("调亮", "app-bright-up", {}),
     ]),
     ("音量", [
         ("减小", "vol-down", {}),
@@ -532,9 +536,14 @@ class ControlPanel(QWidget):
         if setting is None:
             self.bright_label.setText("亮度：读取失败")
             return
-        text = "亮度：%s/255" % setting
+        text = "系统亮度：%s/255" % setting
         if override:
-            text += "   ⚠ %s 占用窗口亮度覆盖" % override
+            # 两条通道要分清：全屏里看到的是 App 自己的亮度，不是这个值
+            text += ("      ⚠ %s 正在全屏占用 → 现在屏幕上生效的是 App 亮度\n"
+                     "      调它请用下面「亮度 · 当前 App 全屏」；退出全屏后回到 %s/255"
+                     % (override, setting))
+        else:
+            text += "（当前生效的就是它）"
         self.bright_label.setText(text)
 
     def set_overlay_state(self, on):
@@ -715,9 +724,12 @@ class PanelHost(object):
                 except Exception as exc:
                     ok, setting, override = False, None, None
                     log("[panel] 状态读取失败: %s" % exc)
-                text = "亮度 %s/255" % setting if setting is not None else "亮度读取失败"
+                text = "系统亮度 %s/255" % setting if setting is not None else "亮度读取失败"
                 if override:
-                    text += "，且 %s 占用窗口亮度覆盖" % override
+                    text += "｜%s 正在全屏占用（全屏里看到的是 App 亮度，退出全屏 = %s/255）" % (
+                        override, setting)
+                else:
+                    text += "｜当前生效的就是它"
                 self.result_box[0] = (ok, text, {
                     "device": self.ctl.adb.target,
                     "online": ok,
@@ -747,7 +759,8 @@ class PanelHost(object):
             log("[panel] %s: %s %s" % (action, "OK" if ok else "FAIL", text))
 
             info = None
-            if action in ("bright-up", "bright-down", "bright", "connect", "connect-addr"):
+            if action in ("bright-up", "bright-down", "bright", "bright-get", "connect",
+                          "connect-addr", "app-bright-up", "app-bright-down"):
                 try:
                     ok2, setting, override = self._state_info()
                     if ok2:

@@ -64,11 +64,11 @@ C_BAD = QColor(255, 143, 143)
 
 HINTS_ARMED = [
     "映射中：左键=点按  拖动=滑动  按住不动=长按  滚轮=上/下视频  中键=桌面",
-    "松开右键退出映射    F按住=倍速   空格=播放暂停   Esc=退出",
+    "←→=系统亮度   Shift+←→=App全屏亮度(滑动)   F按住=倍速   空格=播放暂停   Esc=退出",
 ]
 HINTS_IDLE = [
     "按住鼠标右键 才开始映射（避免误触）    右键快按一下 = 返回",
-    "T=黑/白   [ ]=透明度   F按住=倍速   S=状态   Esc=退出",
+    "T=黑/白   [ ]=透明度   ←→=系统亮度   Shift+←→=App全屏亮度   Esc=退出",
 ]
 
 
@@ -471,9 +471,15 @@ class Overlay(QWidget):
         elif key == Qt.Key_Down:
             self._enqueue("vol-down")
         elif key == Qt.Key_Left:
-            self._enqueue("bright-down")
+            if event.modifiers() & Qt.ShiftModifier:
+                self._enqueue("app-bright-down")     # Shift+← = App 全屏亮度（滑动）
+            else:
+                self._enqueue("bright-down")
         elif key == Qt.Key_Right:
-            self._enqueue("bright-up")
+            if event.modifiers() & Qt.ShiftModifier:
+                self._enqueue("app-bright-up")       # Shift+→ = App 全屏亮度（滑动）
+            else:
+                self._enqueue("bright-up")
         elif key == Qt.Key_Space:
             self._enqueue("play-pause")
         elif key == Qt.Key_L:

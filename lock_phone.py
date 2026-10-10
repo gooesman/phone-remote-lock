@@ -172,6 +172,11 @@ def default_config():
         "brightness_disable_auto": True,
         "brightness_key_repeat": 1,
         "warn_window_override": True,
+        "app_bright_x": 0.85,
+        "app_bright_low": 0.38,
+        "app_bright_high": 0.62,
+        "app_bright_steps": 1,
+        "app_bright_require_override": True,
         "swipe_duration": 160,
         "long_press_ms": 600,
         "long_press_hold_ms": 1200,
@@ -703,11 +708,12 @@ class Adb(object):
         if code != 0:
             return False, "设置亮度失败: %s" % (out.strip() or "unknown")
         current = self.get_brightness()
-        msg = "亮度 -> %s/255" % (current if current is not None else value)
+        msg = "系统亮度 -> %s/255" % (current if current is not None else value)
         if self.cfg.get("warn_window_override", True):
             _, override, _ = self.brightness_state()
             if override:
-                msg += "（%s 正占用窗口级亮度覆盖，可能看不出变化）" % override
+                msg += ("｜⚠ %s 正在全屏占用亮度，屏幕上暂时看不出变化，"
+                        "退出全屏后就是你设的这个值" % override)
         return True, msg
 
     def brightness_key(self, direction, repeat=1):
@@ -725,9 +731,57 @@ class Adb(object):
         if code != 0:
             return False, "亮度键发送失败: %s" % (out.strip() or "unknown")
         current = self.get_brightness()
-        msg = "亮度%s" % ("调高" if direction > 0 else "调低")
+        msg = "系统亮度%s" % ("调高" if direction > 0 else "调低")
         if current is not None:
-            msg += "（当前 %s/255）" % current
+            msg += "（%s/255）" % current
+        if self.cfg.get("warn_window_override", True):
+            _, override, _ = self.brightness_state()
+            if override:
+                msg += "｜%s 全屏覆盖中，如需调它请用「App 亮度」滑动" % override
+        return True, msg
+
+    # -- App 内亮度（全屏里的滑动亮度，跟系统亮度是两条通道）-------
+
+    def app_brightness_gesture(self, direction=1, steps=1):
+        """
+        模拟 App 自己的亮度手势（B站 / 抖音全屏里右侧上下滑）。
+
+        ⚠ 这条通道改的是**应用窗口级亮度覆盖**，完全不动系统设置：
+           - 全屏时：屏幕上看到的就是它
+           - 退出全屏：回到我们用 settings / 亮度键设的系统亮度
+        优先上滑增加、下滑降低（跟 B 站横屏一致），位置取屏幕右侧一条竖线，
+        离边缘留足距离，避免误触系统的边缘返回手势。
+        """
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+
+        # 安全阀：没有 App 占用窗口亮度时，这记滑动可能被当成"切换视频/翻页"，宁可不发
+        _, override, _ = self.brightness_state()
+        if not override and self.cfg.get("app_bright_require_override", True):
+            return False, ("现在没有 App 占用窗口亮度（手机上看到的就是系统亮度），"
+                           "这记滑动可能会被当成翻页/切视频，已拦下。"
+                           "先让视频进全屏再调；确实要发可以在 config.json 里把 "
+                           "app_bright_require_override 设为 false")
+
+        x = float(self.cfg.get("app_bright_x", 0.85))
+        low = float(self.cfg.get("app_bright_low", 0.38))
+        high = float(self.cfg.get("app_bright_high", 0.62))
+        steps = max(1, int(steps))
+        for _ in range(steps):
+            if direction > 0:
+                ok, info = self.swipe_ratio(x, high, x, low, duration=180)   # 上滑 = 更亮
+            else:
+                ok, info = self.swipe_ratio(x, low, x, high, duration=180)   # 下滑 = 更暗
+            if not ok:
+                return False, info
+            time.sleep(0.12)
+        msg = "App 亮度%s（全屏内滑动 %d 次）" % (
+            "调高" if direction > 0 else "调低", steps)
+        if override:
+            msg += "｜%s 正在占用窗口亮度" % override
+        else:
+            msg += "｜没有 App 占用窗口亮度（app_bright_require_override 已关闭，照样发出）"
         return True, msg
 
     # -- 状态 ------------------------------------------------------
@@ -829,17 +883,27 @@ class Controller(object):
             return self.adb.brightness_key(+1, self.cfg.get("brightness_key_repeat", 1))
         if name == "bright-down":
             return self.adb.brightness_key(-1, self.cfg.get("brightness_key_repeat", 1))
+        if name in ("app-bright-up", "fullscreen-bright-up", "window-bright-up"):
+            return self.adb.app_brightness_gesture(
+                +1, kwargs.get("steps") or self.cfg.get("app_bright_steps", 1))
+        if name in ("app-bright-down", "fullscreen-bright-down", "window-bright-down"):
+            return self.adb.app_brightness_gesture(
+                -1, kwargs.get("steps") or self.cfg.get("app_bright_steps", 1))
         if name == "bright":
             return self.adb.set_brightness(kwargs.get("value"))
         if name == "bright-get":
             setting, override, cached = self.adb.brightness_state()
             if setting is None:
                 return False, "读不到亮度"
-            msg = "亮度设置 %s/255" % setting
+            msg = "系统亮度 %s/255" % setting
             if cached is not None:
-                msg += " · 生效值 %.4f" % cached
+                msg += " · 当前生效值 %.4f" % cached
             if override:
-                msg += " · %s 占用窗口覆盖" % override
+                msg += ("｜⚠ %s 正在全屏占用窗口亮度（全屏里看到的不是系统亮度，"
+                        "要调它用「App 亮度 + / −」滑动；退出全屏就是 %s/255）"
+                        % (override, setting))
+            else:
+                msg += "｜当前没有 App 占用，屏幕上生效的就是它"
             return True, msg
         if name == "swipe":
             return self.adb.swipe(kwargs.get("x1"), kwargs.get("y1"),
@@ -1005,7 +1069,7 @@ class TrayApp(object):
                 pystray.MenuItem("音量 -", lambda: self._fire("vol-down", "音量")),
                 pystray.MenuItem("静音", lambda: self._fire("mute", "音量")),
             )),
-            pystray.MenuItem("亮度", pystray.Menu(
+            pystray.MenuItem("系统亮度（退出全屏后生效）", pystray.Menu(
                 pystray.MenuItem("亮度 +", lambda: self._fire("bright-up", "亮度")),
                 pystray.MenuItem("亮度 -", lambda: self._fire("bright-down", "亮度")),
                 pystray.MenuItem("查看当前亮度", lambda: self._fire("bright-get", "亮度")),
@@ -1013,6 +1077,10 @@ class TrayApp(object):
                 pystray.MenuItem("最暗 (10%)", lambda: self._fire("bright", "亮度", value=26)),
                 pystray.MenuItem("中等 (50%)", lambda: self._fire("bright", "亮度", value=128)),
                 pystray.MenuItem("最亮 (100%)", lambda: self._fire("bright", "亮度", value=255)),
+            )),
+            pystray.MenuItem("App 亮度（全屏里滑动调）", pystray.Menu(
+                pystray.MenuItem("调高 +", lambda: self._fire("app-bright-up", "App 亮度")),
+                pystray.MenuItem("调低 -", lambda: self._fire("app-bright-down", "App 亮度")),
             )),
             pystray.MenuItem("刷视频", pystray.Menu(
                 pystray.MenuItem("下一个（上滑）", lambda: self._fire("next", "刷视频")),
@@ -1063,6 +1131,7 @@ class TrayApp(object):
             "overlay": "映射层", "overlay-toggle": "映射层", "overlay-on": "映射层",
             "overlay-off": "映射层", "panel": "控制面板", "bright-get": "亮度",
             "connect": "连接", "long-press": "倍速", "speed": "倍速",
+            "app-bright-up": "App亮度", "app-bright-down": "App亮度",
         }
         mapping = {}
         for hotkey, action in (self.cfg.get("actions") or {}).items():
@@ -1224,6 +1293,8 @@ MENU_ITEMS = [
     ("5", "静音", "mute"),
     ("6", "亮度 +", "bright-up"),
     ("7", "亮度 -", "bright-down"),
+    ("+", "App 亮度 +（全屏内滑动）", "app-bright-up"),
+    ("-", "App 亮度 -（全屏内滑动）", "app-bright-down"),
     ("8", "查看当前亮度", "bright-get"),
     ("9", "下一个视频（上滑）", "next"),
     ("a", "上一个视频（下滑）", "prev"),
@@ -1498,6 +1569,7 @@ def main(argv):
         "lock": {}, "wake": {}, "vol-up": {}, "vol-down": {}, "mute": {},
         "play-pause": {}, "next-track": {}, "prev-track": {}, "home": {}, "back": {},
         "app-switch": {}, "next": {}, "prev": {}, "bright-up": {}, "bright-down": {},
+        "app-bright-up": {}, "app-bright-down": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {},
     }

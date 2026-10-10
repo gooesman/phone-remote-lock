@@ -2293,6 +2293,50 @@ def _open(path):
         log("打开 %s 失败: %s" % (path, exc))
 
 
+def _dot_test(cfg, at=None, hold_ms=2500):
+    """验证"注入的触摸会不会显示圆点"：开圆点 → 按住屏幕 → 抓一张图。
+
+    你的 HyperOS 上圆点只对物理手指显示（开发者实测），但也有机型会显示注入事件。
+    这个命令就是用来一次性把话说清楚的：跑完看 dot_test.png 里有没有那个圈。
+    """
+    adb = Adb(cfg)
+    ok, info = adb.ensure()
+    if not ok:
+        say("FAIL 连不上手机：%s" % info)
+        say("     手机上重新打开「开发者选项 → 无线调试」，然后再跑一次本命令。")
+        return 1, False, info
+    w, h = at or adb.display_size(force=True)
+    if not w or not h:
+        say("FAIL 读不到分辨率")
+        return 1, False, "读不到分辨率"
+    ok1, msg1 = adb.set_pointer_aids(1, 0)          # show_touches=1, pointer_location=0
+    say("show_touches 现在是 %s（设置%s）" % (adb.pointer_aids_state(), "成功" if ok1 else "失败"))
+    x, y = w // 2, h // 2
+    say("在屏幕正中 (%d, %d) 按住 %dms 并抓屏…" % (x, y, hold_ms))
+    adb.press_down(x, y)
+    time.sleep(0.8)
+    shot = ""
+    try:
+        proc = subprocess.run([resolve_adb(cfg), "-s", adb.target, "exec-out",
+                               "screencap", "-p"], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=30,
+                              creationflags=NO_WINDOW)
+        shot = os.path.join(HERE, "dot_test.png")
+        with open(shot, "wb") as fh:
+            fh.write(proc.stdout)
+    except Exception as exc:
+        adb.press_up()
+        return 1, False, "抓屏失败：%s" % exc
+    time.sleep(0.4)
+    adb.press_up()
+    say("截图已保存：%s" % shot)
+    say("请打开这张图看一眼按住的位置**有没有出现半透明的小圆圈**：")
+    say("  · 有  → 说明这台机器会显示注入触摸的圆点，把映射层的圆点开着就能用了")
+    say("  · 没有 → 系统只对物理手指显示（和开发者实测一致），要走 HID/scrcpy --otg 才有光标")
+    adb.close_channel("dot-test 结束")
+    return 0, True, shot
+
+
 def _doctor(cfg):
     """一键体检：手机为什么没被识别 / 怎么才能用 scrcpy --otg 拿到手机原生光标。"""
     def line(text=""):
@@ -2702,8 +2746,12 @@ def main(argv):
         "install-apk": {}, "uninstall-apk": {}, "launch-app": {},
         "mouse-mode": {}, "overlay-size": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
-        "overlay-toggle": {},
+        "overlay-toggle": {}, "doctor": {}, "dot-test": {},
     }
+
+    if action in ("dot-test", "touch-dot"):
+        code, _ok, _msg = _dot_test(cfg)
+        return code
 
     if action in ("doctor", "usb-check"):
         return _doctor(cfg)

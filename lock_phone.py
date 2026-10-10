@@ -33,6 +33,9 @@ phone-remote-lock —— 把手机变成电脑的「遥控对象」：锁屏 / �
     python lock_phone.py speed-toggle         倍速开关（按住不放，再按一次关闭）
     python lock_phone.py long-press-once      长按一下（同点 swipe，App 认这个）
     python lock_phone.py unlock               一键解锁（唤醒 + 上滑 + 可选 PIN）
+    python lock_phone.py install-apk xx.apk    一键安装 APK（也可把 apk 拖到 install_apk.bat）
+    python lock_phone.py uninstall-apk 包名     卸载
+    python lock_phone.py launch-app 包名        启动某个 App
     python lock_phone.py next-video           下一个视频（横屏自动改为点「下一个」按钮）
     python lock_phone.py status               查看连接 / 屏幕 / 亮度
     python lock_phone.py connect              引导式输入 IP:端口 连接手机（双击 connect.bat）
@@ -43,6 +46,7 @@ phone-remote-lock —— 把手机变成电脑的「遥控对象」：锁屏 / �
 
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -276,9 +280,20 @@ def default_config():
         "map_requires_right": True,
         "arm_click_ms": 250,
         "command_timeout": 12,
+        "use_channel": True,
+        "channel_timeout": 8,
+        "channel_retry_gap": 30,
+        "display_size_ttl": 120,
+        "brightness_state_ttl": 2,
         "auto_discover": True,
         "allow_kill_server": True,
         "retry_cooldown": 4.0,
+        "ensure_ttl": 5,
+        "apk_grant_permissions": True,
+        "apk_push_fallback": True,
+        "apk_install_timeout": 300,
+        "last_apk": "",
+        "last_apk_dir": "",
         "notify": True,
     }
 
@@ -423,6 +438,151 @@ def resolve_adb(cfg):
     return None
 
 
+# ---------------------------------------------------------------- 常驻 adb 通道
+
+CHANNEL_MARK = "__ADBCHAN__"
+
+
+def _quote(arg):
+    """把参数安全地拼进设备端 shell 的一行命令里。"""
+    text = str(arg)
+    if text and all(c.isalnum() or c in "-_./:=@,+%" for c in text):
+        return text
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+class AdbChannel(object):
+    """
+    常驻 `adb shell` 长连接：命令写进 stdin，输出按哨兵行分帧。
+
+    为什么值得做：实测每次 `adb.exe` 调用光「进程启动 + 与 adb server 握手」就要 ~36ms，
+    而设备真正执行往往只有 10-60ms —— 固定开销占了大头。
+    常驻一条 shell 之后，每条命令的额外成本只剩本机管道 + 设备执行（约 1-3ms）。
+
+    只用来跑**快命令**（settings / cmd / dumpsys / cat / getprop / keyevent / tap /
+    motionevent / text）；`input swipe`、长按这类会阻塞几百毫秒的命令仍走一次性进程，
+    免得把通道堵住（那是一条串行管道）。
+
+    任何异常（超时、连接断、进程退出）都会把通道标记为 broken 并返回 None，
+    调用方回退到一次性进程 —— 也就是「最坏情况退化成现在的行为」。
+    """
+
+    def __init__(self, argv, timeout=8.0):
+        self.argv = list(argv)
+        self.timeout = timeout
+        self.broken = False
+        self.reason = ""
+        self.started = 0
+        self.commands = 0
+        self._proc = None
+        self._queue = None
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._start()
+
+    # -- 生命周期 --------------------------------------------------
+
+    def _start(self):
+        try:
+            self._proc = subprocess.Popen(
+                self.argv,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, creationflags=NO_WINDOW, bufsize=0)
+        except Exception as exc:
+            self.broken = True
+            self.reason = "启动失败: %s" % exc
+            log("[channel] %s" % self.reason)
+            return
+        self._queue = queue.Queue()
+        self.started = time.time()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        """后台读线程：一行一行塞进队列，EOF 时塞 None 作为断开信号。"""
+        try:
+            stream = self._proc.stdout
+            while True:
+                raw = stream.readline()
+                if not raw:
+                    break
+                self._queue.put(raw.decode("utf-8", "replace").rstrip("\r\n"))
+        except Exception:
+            pass
+        try:
+            self._queue.put(None)
+        except Exception:
+            pass
+
+    def _kill(self, reason):
+        self.broken = True
+        self.reason = reason
+        log("[channel] 关闭：%s" % reason)
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.kill()
+        except Exception:
+            pass
+
+    def alive(self):
+        return (not self.broken) and self._proc is not None and self._proc.poll() is None
+
+    def close(self):
+        if self._proc is not None:
+            self._kill("主动关闭")
+
+    # -- 执行 ------------------------------------------------------
+
+    def run(self, command, timeout=None, script=False):
+        """
+        跑一条命令。command 为 list（自动加哨兵）或 script=True 时的整段 shell 文本。
+
+        返回 (code, output)；通道不可用时返回 None（调用方回退）。
+        """
+        if not self.alive():
+            return None
+        timeout = float(timeout or self.timeout)
+        if script:
+            text = str(command)
+        else:
+            text = " ".join(_quote(a) for a in command)
+        with self._lock:
+            if not self.alive():
+                return None
+            self._seq += 1
+            token = "%s%d__" % (CHANNEL_MARK, self._seq)
+            line = "%s; echo %s$?\n" % (text, token)
+            try:
+                self._proc.stdin.write(line.encode("utf-8"))
+                self._proc.stdin.flush()
+            except Exception as exc:
+                self._kill("写入失败: %s" % exc)
+                return None
+
+            out = []
+            deadline = time.time() + timeout
+            while True:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    self._kill("命令超时（%ss）" % timeout)
+                    return None
+                try:
+                    item = self._queue.get(timeout=remain)
+                except queue.Empty:
+                    self._kill("命令超时（%ss）" % timeout)
+                    return None
+                if item is None:
+                    self._kill("设备连接已断开")
+                    return None
+                match = re.match(r"^%s(\d+)__(\d+)$" % CHANNEL_MARK, item)
+                if match:
+                    self.commands += 1
+                    return int(match.group(2)), "\n".join(out)
+                out.append(item)
+
+    def stats(self):
+        return "命令 %d 条 / 存活 %.0fs" % (self.commands, time.time() - self.started)
+
+
 class Adb(object):
     def __init__(self, cfg):
         self.cfg = cfg
@@ -430,6 +590,13 @@ class Adb(object):
         self.target = (cfg.get("device") or "").strip()
         self._last_fail = 0.0
         self._last_fail_msg = ""
+        self._chan = None
+        self._chan_fail_at = 0.0
+        self._size_cache = None          # ((w, h), 取到的时间)
+        self._bright_cache = None        # ((设置值, 覆盖包名, 生效值), 取到的时间)
+        self.chan_hits = 0
+        self.chan_misses = 0
+        self._last_ok = 0.0             # 最近一次确认在线的时间（ensure 快路径用）
 
     # -- 底层 ------------------------------------------------------
 
@@ -451,8 +618,81 @@ class Adb(object):
         except Exception as exc:
             return -1, "adb 执行失败: %s" % exc
 
-    def _shell(self, command, timeout=None):
-        return self._exec(["-s", self.target, "shell"] + list(command), timeout=timeout)
+    # -- 常驻通道 --------------------------------------------------
+
+    def _channel_allowed(self, command):
+        """哪些命令可以走常驻通道：必须是"快命令"，不能阻塞几百毫秒。"""
+        if not self.cfg.get("use_channel", True) or not command:
+            return False
+        head = command[0]
+        if head in ("settings", "cmd", "dumpsys", "cat", "getprop", "wm", "ls",
+                    "echo", "pm", "sh", "which"):
+            return True
+        if head == "input":
+            sub = command[1] if len(command) > 1 else ""
+            return sub in ("keyevent", "tap", "motionevent", "text")
+        return False
+
+    def _get_channel(self, force=False):
+        """拿常驻通道；不可用返回 None（调用方回退）。失败后 30 秒内不再重试。"""
+        if not self.cfg.get("use_channel", True):
+            return None
+        if not self.adb or not self.target:
+            return None
+        now = time.time()
+        if self._chan is not None and self._chan.alive():
+            return self._chan
+        if not force and now - self._chan_fail_at < float(self.cfg.get("channel_retry_gap", 30)):
+            return None
+        if self._chan is not None:
+            self._chan.close()
+            self._chan = None
+        self._chan = AdbChannel([self.adb, "-s", self.target, "shell"],
+                                timeout=self.cfg.get("channel_timeout", 8))
+        if not self._chan.alive():
+            self._chan_fail_at = now
+            self._chan = None
+            return None
+        log("[channel] 已建立常驻通道（%s）" % self.target)
+        return self._chan
+
+    def close_channel(self, reason=""):
+        """设备重连、切模式、退出时调用：确保下次重新建连。"""
+        if self._chan is not None:
+            self._chan.close()
+            self._chan = None
+        self._chan_fail_at = 0.0
+        if reason:
+            log("[channel] 已重置：%s" % reason)
+
+    def channel_stats(self):
+        if self._chan is None:
+            return "常驻通道未启用（命中 %d / 回退 %d）" % (self.chan_hits, self.chan_misses)
+        return "常驻通道 %s（命中 %d / 回退 %d）" % (
+            self._chan.stats(), self.chan_hits, self.chan_misses)
+
+    def _shell(self, command, timeout=None, script=False):
+        """
+        跑设备端命令。
+
+        快命令优先走常驻通道（省掉每次 ~36ms 的进程启动），
+        其余（swipe / 长命令 / 通道不可用）走一次性进程 —— 行为完全等价。
+        """
+        if script or self._channel_allowed(command):
+            chan = self._get_channel()
+            if chan is not None:
+                result = chan.run(command, timeout=timeout, script=script)
+                if result is not None:
+                    self.chan_hits += 1
+                    return result
+                self.chan_misses += 1          # 通道坏了，下面回退
+                self._chan_fail_at = time.time()
+        args = ["-s", self.target, "shell"]
+        if script:
+            args += ["sh", "-c", str(command)]
+        else:
+            args += list(command)
+        return self._exec(args, timeout=timeout)
 
     # -- 连接 ------------------------------------------------------
 
@@ -506,20 +746,47 @@ class Adb(object):
 
         手机离线时一次完整性重连要跑好几轮，所以失败后短时间内直接复用上次的错误，
         避免每个按钮都卡十几秒。显式点「重新连接」时传 force=True 绕过冷却。
+
+        在线时也有两级快路径，避免**每个动作**都新起一个 adb 进程去查 `adb devices`：
+          1. 刚成功过（ensure_ttl 秒内）→ 直接返回；
+          2. 常驻通道还活着 → 用一条 echo 探活（1-3ms，不起新进程）。
         """
         now = time.time()
         cooldown = float(self.cfg.get("retry_cooldown", 4.0) or 0)
         if not force and self._last_fail and (now - self._last_fail) < cooldown:
             return False, self._last_fail_msg
 
+        ttl = float(self.cfg.get("ensure_ttl", 5) or 0)
+        if not force and self._last_ok and (now - self._last_ok) < ttl:
+            return True, self.target
+        if not force and self._ensure_fast():
+            self._last_ok = now
+            self._last_fail = 0.0
+            return True, self.target
+
         ok, message = self._ensure_impl()
         if ok:
             self._last_fail = 0.0
             self._last_fail_msg = ""
+            self._last_ok = time.time()
         else:
+            self._last_ok = 0.0
             self._last_fail = time.time()
             self._last_fail_msg = message
         return ok, message
+
+    def _ensure_fast(self):
+        """常驻通道活着就算在线（一条 echo 探活），失败则作废通道返回 False。"""
+        chan = self._get_channel()
+        if chan is None:
+            return False
+        result = chan.run(["echo", "ok"], timeout=min(3.0, float(
+            self.cfg.get("channel_timeout", 8) or 8)))
+        if result is None:
+            self._chan_fail_at = time.time()
+            return False
+        code, out = result
+        return code == 0 and "ok" in (out or "")
 
     def _ensure_impl(self):
         if not self.adb:
@@ -672,19 +939,35 @@ class Adb(object):
         w, h = sizes[-1]
         return int(w), int(h)
 
-    def display_size(self):
+    def display_size(self, force=False):
         """
         当前逻辑显示尺寸（随旋转变化）。
 
         这就是 input tap / input swipe 真正使用的坐标系：
         横屏时是 3200x1440，竖屏时是 1440x3200。
+
+        带缓存：每次 swipe/tap 前都问一次的话，每条动作白白多一次
+        `dumpsys window displays`（一次 adb 调用 ≈36ms）。
+        旋转后要么按 R（映射层）刷新，要么等 ttl 到期，要么连接时自动失效。
         """
+        ttl = float(self.cfg.get("display_size_ttl", 180) or 0)
+        if not force and self._size_cache:
+            size, at = self._size_cache
+            if size and (ttl <= 0 or time.time() - at < ttl):
+                return size
         code, out = self._shell(["dumpsys", "window", "displays"], timeout=15)
         if code == 0 and out:
             found = re.search(r"\bcur=(\d+)x(\d+)", out)
             if found:
-                return int(found.group(1)), int(found.group(2))
-        return self.screen_size()
+                size = (int(found.group(1)), int(found.group(2)))
+                self._size_cache = (size, time.time())
+                return size
+        size = self.screen_size()
+        self._size_cache = ((size or (None, None)), time.time())
+        return size
+
+    def invalidate_size(self):
+        self._size_cache = None
 
     def swipe_ratio(self, fx1, fy1, fx2, fy2, duration=160):
         ok, info = self.ready()
@@ -841,24 +1124,27 @@ class Adb(object):
         return self.tap(int(w * fx), int(h * fy))
 
     def double_tap_ratio(self, fx=0.5, fy=0.5, gap=0.09):
-        """双击（抖音点赞、B站播放/暂停都是双击）。"""
+        """双击（抖音点赞、B站播放/暂停都是双击）。两条 tap 合成一次调用。"""
         w, h = self.display_size()
         if not w or not h:
             return False, "读不到分辨率"
         x, y = int(w * fx), int(h * fy)
-        ok, info = self.tap(x, y)
-        if not ok:
-            return False, info
-        time.sleep(gap)
-        ok, info = self.tap(x, y)
-        return (True, "已双击 (%.2f,%.2f)" % (fx, fy)) if ok else (ok, info)
+        script = "input tap %d %d; sleep %.2f; input tap %d %d" % (x, y, gap, x, y)
+        code, out = self._shell(script, script=True)
+        if code != 0:
+            return False, (out or "").strip() or "双击失败"
+        return True, "已双击 (%.2f,%.2f)" % (fx, fy)
 
     # -- 找屏幕上的按钮（横屏换视频等）-----------------------------
 
     def dump_ui(self):
-        """把当前界面的 UI 树 dump 下来（uiautomator），返回 XML 文本。"""
-        self._shell(["uiautomator", "dump", "/sdcard/window_dump.xml"], timeout=20)
-        code, out = self._shell(["cat", "/sdcard/window_dump.xml"], timeout=20)
+        """把当前界面的 UI 树 dump 下来（uiautomator），返回 XML 文本。
+
+        dump + cat 合成一条命令，省一次 adb 往返（uiautomator 的提示输出丢掉）。
+        """
+        script = ("uiautomator dump /sdcard/window_dump.xml >/dev/null 2>&1; "
+                  "cat /sdcard/window_dump.xml")
+        code, out = self._shell(script, timeout=25, script=True)
         return out if code == 0 else ""
 
     def find_node(self, texts, descs=(), ids=()):
@@ -919,6 +1205,169 @@ class Adb(object):
                 return ok, info
         return False, "界面上没找到这些按钮：%s" % "/".join(list(texts))
 
+    # -- 安装 / 卸载 APK -------------------------------------------
+
+    def list_third_party(self):
+        """第三方包名集合（用来对比安装前后，识别刚装的是哪个包）。"""
+        code, out = self._shell(["pm", "list", "packages", "-3"], timeout=20)
+        if code != 0:
+            return set()
+        return {line.strip().split(":")[-1] for line in (out or "").splitlines()
+                if line.strip().startswith("package:")}
+
+    @staticmethod
+    def _install_flags(replace=True, grant=True, downgrade=True, test_only=True):
+        flags = []
+        if replace:
+            flags.append("-r")
+        if grant:
+            flags.append("-g")          # 装完直接把运行时权限授全，省得手机上点
+        if test_only:
+            flags.append("-t")          # 允许 test-only 包
+        if downgrade:
+            flags.append("-d")
+        return flags
+
+    @staticmethod
+    def _install_hint(output):
+        """把 adb install 的错误码翻译成人话 + 该怎么办。"""
+        text = output or ""
+        table = [
+            ("INSTALL_FAILED_USER_RESTRICTED",
+             "手机限制了 USB 安装。小米/HyperOS：开发者选项 → 打开「USB 安装」"
+             "（部分机型要登录小米账号 + 插 SIM 卡才给开）"),
+            ("INSTALL_FAILED_UPDATE_INCOMPATIBLE",
+             "签名不一致：手机上装过同包名但签名不同的版本，先卸载它再装"
+             "（用「卸载 APK」按钮或 adb uninstall <包名>）"),
+            ("INSTALL_FAILED_VERSION_DOWNGRADE", "版本比手机上现有的低，已尝试 -d 降级安装"),
+            ("INSTALL_FAILED_ALREADY_EXISTS", "同名包已存在，已尝试 -r 覆盖安装"),
+            ("INSTALL_FAILED_INSUFFICIENT_STORAGE", "手机存储空间不足"),
+            ("INSTALL_FAILED_VERIFICATION_FAILURE",
+             "被系统的安装校验拦了（MIUI 安全中心/应用校验），手机上允许一次即可"),
+            ("INSTALL_PARSE_FAILED_NO_CERTIFICATES", "APK 没有签名或签名损坏"),
+            ("INSTALL_PARSE_FAILED", "APK 解析失败：文件损坏或与设备不兼容"),
+            ("INSTALL_FAILED_NO_MATCHING_ABIS", "APK 不含这台机器的 CPU 架构（如只要 x86）"),
+            ("INSTALL_FAILED_OLDER_SDK", "APK 要求的最低 Android 版本比手机高"),
+            ("INSTALL_FAILED_INVALID_APK", "APK 无效（下载不完整？）"),
+            ("failed to read copy response", "传输中断（无线 adb 偶尔会），可以重试或走 push 方式"),
+            ("device offline", "连接掉了，先重新连接手机"),
+        ]
+        for key, tip in table:
+            if key in text:
+                return tip
+        return ""
+
+    @staticmethod
+    def _transport_error(output):
+        """是不是"传输断了"这一类错误（只有这类才值得换 push 方式重试）。
+
+        像 INSTALL_FAILED_USER_RESTRICTED / UPDATE_INCOMPATIBLE 这种，
+        换 push 还是会失败，白等一轮还会误导人。
+        """
+        text = (output or "").lower()
+        for key in ("failed to read copy response", "failed to write", "error: closed",
+                    "broken pipe", "connection reset", "protocol fault",
+                    "couldn't read status", "no error"):
+            if key in text:
+                return True
+        return False
+
+    def install_apk(self, path, replace=True, grant=None, push_fallback=None):
+        """
+        一键装 APK：`adb install -r -g -t -d`；失败时自动换 push + `pm install` 再试一次。
+
+        装完用「第三方包名集合 diff」确认新增的是哪个包，返回给界面显示。
+        """
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        path = os.path.abspath(os.path.expanduser(str(path or "").strip('"')))
+        if not os.path.isfile(path):
+            return False, "找不到文件：%s" % path
+        if not path.lower().endswith(".apk"):
+            return False, "只支持 .apk 文件（拆分包请把多个 apk 放进同一个文件夹再选文件夹）"
+        if grant is None:
+            grant = bool(self.cfg.get("apk_grant_permissions", True))
+        if push_fallback is None:
+            push_fallback = bool(self.cfg.get("apk_push_fallback", True))
+        timeout = int(self.cfg.get("apk_install_timeout", 300) or 300)
+        size_mb = os.path.getsize(path) / 1048576.0
+
+        before = self.list_third_party()
+        flags = self._install_flags(replace=replace, grant=grant)
+        code, out = self._exec(["install"] + flags + [path], timeout=timeout)
+        text = (out or "").strip()
+        success = (code == 0 and "Success" in text)
+
+        if not success and push_fallback and self._transport_error(text):
+            log("[apk] 传输类失败，改走 push + pm install：%s" % text[:120])
+            pushed = self._install_via_push(path, grant, timeout)
+            if pushed[0]:
+                success, text = True, pushed[1]
+            else:
+                text += "\n（push 方式也失败：%s）" % pushed[1]
+        elif not success and push_fallback:
+            log("[apk] 非传输类失败，不重试：%s" % text[:120])
+
+        if not success:
+            hint = self._install_hint(text)
+            msg = "安装失败：%s" % (text[-400:] or "adb 没有返回原因")
+            if hint:
+                msg += "\n提示：%s" % hint
+            return False, msg
+
+        after = self.list_third_party()
+        new_pkgs = sorted(after - before)
+        self.close_channel("装完 APK 后刷新连接")
+        if new_pkgs:
+            return True, "已安装 %.1fMB：%s" % (size_mb, "、".join(new_pkgs))
+        return True, "已安装 %.1fMB（adb 返回 Success；包名没变化说明是覆盖升级）" % size_mb
+
+    def _install_via_push(self, path, grant, timeout):
+        """先 push 到 /data/local/tmp 再用 pm install —— 无线 adb 不稳时的备选。"""
+        remote = "/data/local/tmp/_push_install.apk"
+        code, out = self._exec(["push", path, remote], timeout=timeout)
+        if code != 0:
+            return False, "push 失败：%s" % (out or "").strip()[-200:]
+        flags = self._install_flags(grant=grant)
+        script = "pm install %s %s" % (" ".join(flags), remote)
+        code, out = self._shell(script, timeout=timeout, script=True)
+        self._shell(["rm", "-f", remote], timeout=10)
+        if code == 0 and "Success" in (out or ""):
+            return True, "已安装（push + pm install）"
+        return False, (out or "").strip()[-200:]
+
+    def uninstall_package(self, package, keep_data=False):
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        package = (package or "").strip().split(":")[-1]
+        if not package or "." not in package:
+            return False, "包名看起来不对：%s（形如 com.example.app）" % package
+        args = ["uninstall"] + (["-k"] if keep_data else []) + [package]
+        code, out = self._exec(args, timeout=120)
+        text = (out or "").strip()
+        if "Success" in text:
+            return True, "已卸载 %s" % package
+        hint = self._install_hint(text)
+        msg = "卸载失败：%s" % (text or "adb 没有返回原因")
+        if hint:
+            msg += "\n提示：%s" % hint
+        return False, msg
+
+    def launch_package(self, package):
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        package = (package or "").strip().split(":")[-1]
+        if not package:
+            return False, "请给包名"
+        script = ("monkey -p %s -c android.intent.category.LAUNCHER 1" % package)
+        code, out = self._shell(script, timeout=20, script=True)
+        if code == 0 and "Events injected: 1" in (out or ""):
+            return True, "已启动 %s" % package
+        return False, "启动失败：%s" % ((out or "").strip()[-200:] or "包名对不对？")
+
     # -- 锁屏 / 解锁 -----------------------------------------------
 
     def is_locked(self):
@@ -978,7 +1427,7 @@ class Adb(object):
         match = re.search(r"(\d+)", out or "")
         return int(match.group(1)) if match else None
 
-    def brightness_state(self):
+    def brightness_state(self, force=False):
         """
         返回 (设置值, 占用窗口级亮度覆盖的包名, PMS 缓存亮度)。
 
@@ -987,22 +1436,51 @@ class Adb(object):
           1. 系统级覆盖 cmd display set-brightness
           2. 应用窗口级覆盖（抖音/B站播放器的亮度手势），优先级最高
         这里把窗口覆盖的包名读出来，便于解释「改了没反应」。
+
+        settings + dumpsys 合成**一次** adb 调用（原本是两次，白白多花 ~36ms）。
         """
-        setting = self.get_brightness()
-        override = None
-        cached = None
-        code, out = self._shell(["dumpsys", "display"], timeout=25)
+        ttl = float(self.cfg.get("brightness_state_ttl", 2) or 0)
+        if not force and self._bright_cache:
+            value, at = self._bright_cache
+            if ttl > 0 and time.time() - at < ttl:
+                return value
+        script = ("settings get system screen_brightness; echo @@BRIGHT@@; dumpsys display")
+        code, out = self._shell(script, timeout=25, script=True)
+        result = (None, None, None)
         if code == 0 and out:
-            found = re.search(r"mBrightnessReason=override\(([\w.]+)/", out)
+            head, _sep, tail = out.partition("@@BRIGHT@@")
+            match = re.search(r"(\d+)", head)
+            setting = int(match.group(1)) if match else None
+            override = None
+            found = re.search(r"mBrightnessReason=override\(([\w.]+)/", tail)
             if found:
                 override = found.group(1)
-            cached_all = re.findall(r"mCachedBrightnessInfo\.brightness=([\d.eE+-]+)", out)
+            cached = None
+            cached_all = re.findall(r"mCachedBrightnessInfo\.brightness=([\d.eE+-]+)", tail)
             if cached_all:
                 try:
                     cached = float(cached_all[-1])
                 except ValueError:
                     cached = None
-        return setting, override, cached
+            result = (setting, override, cached)
+        elif code != 0:
+            # 通道/设备异常时退回老路径，保证信息不断
+            setting = self.get_brightness()
+            override, cached = None, None
+            code2, out2 = self._shell(["dumpsys", "display"], timeout=25)
+            if code2 == 0 and out2:
+                found = re.search(r"mBrightnessReason=override\(([\w.]+)/", out2)
+                if found:
+                    override = found.group(1)
+                cached_all = re.findall(r"mCachedBrightnessInfo\.brightness=([\d.eE+-]+)", out2)
+                if cached_all:
+                    try:
+                        cached = float(cached_all[-1])
+                    except ValueError:
+                        cached = None
+            result = (setting, override, cached)
+        self._bright_cache = (result, time.time())
+        return result
 
     def set_brightness(self, value):
         """绝对值设置（走 settings，持久化，重启后保留）。"""
@@ -1015,6 +1493,7 @@ class Adb(object):
         code, out = self._shell(["settings", "put", "system", "screen_brightness", str(value)])
         if code != 0:
             return False, "设置亮度失败: %s" % (out.strip() or "unknown")
+        self._bright_cache = None
         current = self.get_brightness()
         msg = "系统亮度 -> %s/255" % (current if current is not None else value)
         if self.cfg.get("warn_window_override", True):
@@ -1038,6 +1517,7 @@ class Adb(object):
         code, out = self._shell(["input", "keyevent"] + [str(key)] * max(1, int(repeat)))
         if code != 0:
             return False, "亮度键发送失败: %s" % (out.strip() or "unknown")
+        self._bright_cache = None
         current = self.get_brightness()
         msg = "系统亮度%s" % ("调高" if direction > 0 else "调低")
         if current is not None:
@@ -1084,6 +1564,7 @@ class Adb(object):
             if not ok:
                 return False, info
             time.sleep(0.12)
+        self._bright_cache = None
         msg = "App 亮度%s（%.0f%% 竖线滑动 %d 次）" % (
             "调高" if direction > 0 else "调低", x * 100, steps)
         if override:
@@ -1289,6 +1770,12 @@ class Controller(object):
                 kwargs.get("steps") or self.cfg.get("app_bright_steps", 1))
         if name == "unlock":
             return self.adb.unlock((self.cfg.get("unlock_pin") or "").strip() or None)
+        if name in ("install-apk", "install"):
+            return self.adb.install_apk(kwargs.get("path") or self.cfg.get("last_apk", ""))
+        if name == "uninstall-apk":
+            return self.adb.uninstall_package(kwargs.get("package") or kwargs.get("pkg"))
+        if name in ("launch-app", "launch"):
+            return self.adb.launch_package(kwargs.get("package") or kwargs.get("pkg"))
         if name in ("tap-xy",):
             return self.adb.tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
         if name == "bright-up":
@@ -1471,6 +1958,11 @@ class TrayApp(object):
             pystray.MenuItem("锁定手机", lambda: self._fire("lock", "锁屏")),
             pystray.MenuItem("唤醒屏幕", lambda: self._fire("wake", "唤醒")),
             pystray.MenuItem("解锁手机（唤醒+上滑+PIN）", lambda: self._fire("unlock", "解锁")),
+            pystray.MenuItem("安装 APK 到手机…", _open_install_console),
+            pystray.MenuItem("安装上次的 APK（%s）"
+                             % (os.path.basename(self.cfg.get("last_apk") or "未设置")[:24],),
+                             lambda: self._fire("install-apk", "安装 APK",
+                                                path=self.cfg.get("last_apk") or "")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("映射层（手机矩形）", pystray.Menu(
                 pystray.MenuItem("开启", lambda: self._fire("overlay-on", "映射层")),
@@ -1685,6 +2177,23 @@ def _open(path):
         log("打开 %s 失败: %s" % (path, exc))
 
 
+def _open_install_console():
+    """在新控制台里跑「安装 APK」引导（托盘菜单用）。"""
+    exe = sys.executable or ""
+    if exe.lower().endswith("pythonw.exe"):
+        cand = os.path.join(os.path.dirname(exe), "python.exe")
+        if os.path.exists(cand):
+            exe = cand
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    flags = 0x00000010 if os.name == "nt" else 0
+    try:
+        subprocess.Popen([exe, os.path.join(HERE, "lock_phone.py"), "install-apk"],
+                         cwd=HERE, creationflags=flags, env=env)
+    except Exception as exc:
+        log("[apk] 打开安装窗口失败: %s" % exc)
+
+
 def _open_connect_console():
     """在新控制台窗口里跑「输入 IP:端口 连接手机」的引导（托盘菜单用）。"""
     exe = sys.executable or ""
@@ -1738,6 +2247,7 @@ MENU_ITEMS = [
     ("v", "倍速开关（按住不放，再按关闭）", "speed-toggle"),
     ("g", "长按一下（1.2 秒）", "long-press-once"),
     ("u", "解锁手机", "unlock"),
+    ("", "安装 APK 到手机（拖文件到这里也行）", "install-apk"),
     ("o", "切换映射层（手机矩形）", "overlay-toggle"),
     ("k", "打开控制面板", "panel"),
     ("s", "查看连接状态", "status"),
@@ -2008,12 +2518,51 @@ def main(argv):
         "app-vol-up": {}, "app-vol-down": {}, "unlock": {}, "like": {},
         "speed-on": {}, "speed-off": {}, "speed-toggle": {}, "long-press-once": {},
         "seek-forward": {}, "seek-back": {}, "next-video": {},
+        "install-apk": {}, "uninstall-apk": {}, "launch-app": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {},
     }
 
     if action in simple:
         ok, info = ctl.run_action(action)
+        say(("OK   " if ok else "FAIL ") + info)
+        return 0 if ok else 1
+
+    if action in ("install-apk", "install"):
+        path = argv[2] if len(argv) > 2 else ""
+        if not path:
+            say("把 APK 拖到这个窗口里，或直接输入完整路径。")
+            say("（也可以把 APK 拖到 install_apk.bat 上，一步装完）")
+            path = _ask("   APK 路径: ") or ""
+        path = path.strip().strip('"')
+        if not path:
+            say("FAIL 没给路径，已取消")
+            return 1
+        say("   正在安装 %s …" % path)
+        ok, info = ctl.run_action("install-apk", path=path)
+        say(("OK   " if ok else "FAIL ") + info)
+        if ok:
+            cfg["last_apk"] = path
+            cfg["last_apk_dir"] = os.path.dirname(path)
+            save_config(cfg)
+        return 0 if ok else 1
+
+    if action in ("uninstall-apk", "uninstall"):
+        pkg = argv[2] if len(argv) > 2 else ""
+        if not pkg:
+            pkg = _ask("   要卸载的包名（如 com.example.app）: ") or ""
+        if not pkg:
+            say("FAIL 没给包名，已取消")
+            return 1
+        ok, info = ctl.run_action("uninstall-apk", package=pkg)
+        say(("OK   " if ok else "FAIL ") + info)
+        return 0 if ok else 1
+
+    if action in ("launch-app", "launch"):
+        pkg = argv[2] if len(argv) > 2 else ""
+        if not pkg:
+            pkg = _ask("   要启动的包名: ") or ""
+        ok, info = ctl.run_action("launch-app", package=pkg)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 1
 

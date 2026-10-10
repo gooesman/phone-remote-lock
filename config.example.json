@@ -46,5 +46,16 @@
   "auto_discover": true,
   "allow_kill_server": true,
   "retry_cooldown": 4.0,
-  "notify": true
+  "notify": true,
+  "use_channel": true,
+  "channel_timeout": 8,
+  "channel_retry_gap": 30,
+  "ensure_ttl": 5,
+  "display_size_ttl": 120,
+  "brightness_state_ttl": 2,
+  "apk_grant_permissions": true,
+  "apk_push_fallback": true,
+  "apk_install_timeout": 300,
+  "last_apk": "",
+  "last_apk_dir": ""
 }

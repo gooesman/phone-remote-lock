@@ -39,9 +39,9 @@ try:
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QFont, QKeySequence
     from PySide6.QtWidgets import (
-        QApplication, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout,
-        QHeaderView, QInputDialog, QKeySequenceEdit, QLabel, QLineEdit,
-        QMessageBox, QPushButton, QTableWidget, QVBoxLayout, QWidget,
+        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+        QHBoxLayout, QHeaderView, QInputDialog, QKeySequenceEdit, QLabel,
+        QLineEdit, QMessageBox, QPushButton, QTableWidget, QVBoxLayout, QWidget,
     )
 except ImportError as exc:  # pragma: no cover
     sys.stderr.write("缺少 PySide6：.venv\\Scripts\\python.exe -m pip install PySide6\n%s\n" % exc)
@@ -94,6 +94,11 @@ SECTIONS = [
         ("桌面", "home", {}),
         ("任务切换", "app-switch", {}),
         ("通知栏", "key", {"keycode": 83}),
+    ]),
+    ("应用", [
+        ("安装 APK…", "__install_apk__", {}),
+        ("卸载 APK…", "uninstall-apk", {}),
+        ("启动 App…", "launch-app", {}),
     ]),
 ]
 
@@ -488,8 +493,16 @@ class ControlPanel(QWidget):
             row.setSpacing(6)
             for label, action, kwargs in items:
                 button = QPushButton(label)
-                button.clicked.connect(
-                    lambda _=False, a=action, k=kwargs: self.host.fire(a, **k))
+                if action == "__install_apk__":
+                    button.setToolTip("选一个 .apk 装到手机上（也可以把 apk 拖到 install_apk.bat）")
+                    button.clicked.connect(self._pick_apk)
+                elif action == "uninstall-apk":
+                    button.clicked.connect(self._ask_uninstall)
+                elif action == "launch-app":
+                    button.clicked.connect(self._ask_launch)
+                else:
+                    button.clicked.connect(
+                        lambda _=False, a=action, k=kwargs: self.host.fire(a, **k))
                 row.addWidget(button)
             root.addLayout(row)
 
@@ -547,6 +560,30 @@ class ControlPanel(QWidget):
         # 手势相关的配置变了，让常驻进程用上新参数
         self.host.ctl = Controller(self.host.cfg)
         self.set_status("%s（快捷键/按钮已按该模式生效）" % info)
+
+    def _pick_apk(self):
+        start_dir = self.host.cfg.get("last_apk_dir") or ""
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "选择要安装的 APK", start_dir, "Android 安装包 (*.apk)")
+        if not path:
+            return
+        self.host.cfg["last_apk"] = path
+        self.host.cfg["last_apk_dir"] = os.path.dirname(path)
+        save_config(self.host.cfg)
+        self.set_status("正在安装 %s …（大包要等几十秒）" % os.path.basename(path))
+        self.host.fire("install-apk", path=path)
+
+    def _ask_uninstall(self):
+        pkg, ok = QInputDialog.getText(self, "卸载 APK", "要卸载的包名（如 com.example.app）:")
+        if not ok or not pkg.strip():
+            return
+        self.host.fire("uninstall-apk", package=pkg.strip())
+
+    def _ask_launch(self):
+        pkg, ok = QInputDialog.getText(self, "启动 App", "包名（如 com.example.app）:")
+        if not ok or not pkg.strip():
+            return
+        self.host.fire("launch-app", package=pkg.strip())
 
     def _open_settings(self):
         """左上角「设置」：改快捷键绑定，保存后托盘自动重载。"""
@@ -804,7 +841,8 @@ class PanelHost(object):
 
             info = None
             if action in ("bright-up", "bright-down", "bright", "bright-get", "connect",
-                          "connect-addr", "app-bright-up", "app-bright-down"):
+                          "connect-addr", "app-bright-up", "app-bright-down",
+                          "install-apk", "uninstall-apk", "launch-app"):
                 try:
                     ok2, setting, override = self._state_info()
                     if ok2:

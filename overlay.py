@@ -176,9 +176,9 @@ class Overlay(QWidget):
 
     # ---------------------------------------------------------- 尺寸
 
-    def _read_size(self):
+    def _read_size(self, force=False):
         try:
-            size = self.ctl.adb.display_size()
+            size = self.ctl.adb.display_size(force=force)
         except Exception:
             size = None
         if size and size[0] and size[1]:
@@ -193,7 +193,7 @@ class Overlay(QWidget):
         """
         def runner():
             try:
-                self._read_size()
+                self._read_size(force=True)
                 self.need_layout = True
             except Exception as exc:
                 log("[overlay] 读取分辨率失败: %s" % exc)

@@ -1,4 +1,5 @@
 pynput>=1.7.6
 pystray>=0.19.5
 Pillow>=10.0.0
-PySide6>=6.6.0
+# 只用 QtCore / QtGui / QtWidgets，装 Essentials 就够（比完整 PySide6 省约 150MB）
+PySide6-Essentials>=6.6.0

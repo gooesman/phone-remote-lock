@@ -62,10 +62,10 @@ C_OK = QColor(141, 224, 160)
 C_BAD = QColor(255, 143, 143)
 
 HINTS = [
-    "左键单击 = 点按      左键拖动 = 滑动      滚轮 = 上/下一个视频",
+    "左键单击 = 点按   左键拖动 = 滑动   左键按住不动 = 长按   滚轮 = 上/下一个视频",
     "右键 = 返回    中键 = 桌面    ↑↓ = 音量    ←→ = 亮度    空格 = 播放/暂停",
-    "L = 锁屏   W = 唤醒   N = 通知栏   P = 手机指针   S = 状态   R = 重读分辨率",
-    "F11 = 全屏/窗口切换    Esc = 退出",
+    "F = 按住屏幕中心倍速（松开恢复）   N = 通知栏   P = 手机指针   S = 状态   R = 重读分辨率",
+    "L = 锁屏   W = 唤醒   F11 = 全屏/窗口切换   Esc = 退出",
 ]
 
 
@@ -86,12 +86,25 @@ class Overlay(QWidget):
 
         self.drag_from = None
         self.drag_t0 = 0.0
+        self.drag_moved = False
+        self.holding = False        # 正在手机上进行长按（倍速）状态
+        self.hold_key = False       # F 键按住中
         self.last_wheel = 0.0
         self.status_text = "正在连接手机…"
         self.status_ok = None
         self.mouse_pos = None
-
         self._bg = None
+
+        # 长按（倍速）：鼠标按住不动超过 long_press_ms 就在光标处开始长按
+        self.long_press_ms = int(cfg.get("long_press_ms", 600) or 600)
+        self.long_press_hold_ms = int(cfg.get("long_press_hold_ms", 1200) or 1200)
+        self.long_press_max_ms = int(cfg.get("long_press_max_ms", 4000) or 4000)
+        self.press_timer = QTimer(self)
+        self.press_timer.setSingleShot(True)
+        self.press_timer.timeout.connect(self._hold_start)
+        self.hold_timer = QTimer(self)
+        self.hold_timer.setSingleShot(True)
+        self.hold_timer.timeout.connect(self._hold_timeout)
 
         # 手机端指针显示：None = 还没碰过设置，(show_touches, pointer_location) = 打开前的原值
         self._pointer_prev = None
@@ -246,6 +259,12 @@ class Overlay(QWidget):
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
         self.mouse_pos = (pos.x(), pos.y())
+        if self.drag_from and not self.drag_moved:
+            dx = abs(pos.x() - self.drag_from[0])
+            dy = abs(pos.y() - self.drag_from[1])
+            if dx + dy > 12:
+                self.drag_moved = True
+                self.press_timer.stop()   # 拖动了就不算长按
         self.update()
 
     def mousePressEvent(self, event):
@@ -253,6 +272,9 @@ class Overlay(QWidget):
         if event.button() == Qt.LeftButton:
             self.drag_from = (pos.x(), pos.y())
             self.drag_t0 = time.time()
+            self.drag_moved = False
+            if self.to_phone(pos.x(), pos.y()):
+                self.press_timer.start(self.long_press_ms)
         elif event.button() == Qt.RightButton:
             self._enqueue("back")
         elif event.button() == Qt.MiddleButton:
@@ -262,9 +284,15 @@ class Overlay(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton or self.drag_from is None:
             return
+        self.press_timer.stop()
         pos = event.position().toPoint()
         sx, sy = self.drag_from
         self.drag_from = None
+
+        # 已经进入长按状态：抬手就结束长按（倍速停止）
+        if self.holding:
+            self._hold_end()
+            return
 
         start = self.to_phone(sx, sy)
         end = self.to_phone(pos.x(), pos.y())
@@ -272,13 +300,45 @@ class Overlay(QWidget):
             self._set_status("起点或终点不在映射区内", False)
             return
 
-        if abs(pos.x() - sx) + abs(pos.y() - sy) < 12:
+        if not self.drag_moved and abs(pos.x() - sx) + abs(pos.y() - sy) < 12:
             self._enqueue("tap", x=start[0], y=start[1])
             return
 
         elapsed = int((time.time() - self.drag_t0) * 1000)
         self._enqueue("swipe", x1=start[0], y1=start[1], x2=end[0], y2=end[1],
                       duration=max(120, min(700, elapsed)))
+
+    # ---------------------------------------------------------- 长按 / 倍速
+
+    def _hold_start(self):
+        """鼠标按住不动到阈值：在光标处按下不抬（在短视频里就是倍速播放）。"""
+        if not self.drag_from or self.drag_moved or self.holding:
+            return
+        point = self.to_phone(*self.drag_from)
+        if not point:
+            return
+        self.holding = True
+        self._enqueue("__hold_down__", x=point[0], y=point[1])
+        self.hold_timer.start(self.long_press_max_ms)   # 兜底：防止一直按住不放
+
+    def _hold_end(self):
+        self.holding = False
+        self.hold_timer.stop()
+        self._enqueue("__hold_up__")
+
+    def _hold_timeout(self):
+        if self.holding:
+            self.holding = False
+            self._enqueue("__hold_up__")
+            self._set_status("长按已达上限 %sms，已自动抬起" % self.long_press_max_ms, True)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_F and not event.isAutoRepeat() and self.hold_key:
+            self.hold_key = False
+            self.hold_timer.stop()
+            self._enqueue("__hold_up__")
+            return
+        super().keyReleaseEvent(event)
 
     def wheelEvent(self, event):
         now = time.time()
@@ -315,6 +375,12 @@ class Overlay(QWidget):
             self._enqueue("__size__")
         elif key == Qt.Key_P:
             self._enqueue("__pointer__")
+        elif key == Qt.Key_F:
+            # 按住 = 在屏幕中心保持长按（倍速播放），松开恢复
+            if not event.isAutoRepeat() and not self.hold_key:
+                self.hold_key = True
+                self._enqueue("__hold_center__")
+                self.hold_timer.start(self.long_press_max_ms)
         elif key == Qt.Key_F11:
             if self.isFullScreen():
                 self.showNormal()
@@ -396,6 +462,25 @@ class Overlay(QWidget):
                 else:
                     self.result_box[0] = (True, self._pointer_setup())
                 continue
+            if action == "__hold_center__":
+                # F 键：真按住（倍速），等 keyRelease 再抬
+                w, h = self.ctl.adb.display_size()
+                if not w or not h:
+                    self.result_box[0] = (False, "读不到分辨率，无法长按中心", None)
+                    continue
+                ok, info = self.ctl.adb.press_down(w // 2, h // 2)
+                self.result_box[0] = (ok, "倍速中（松开 F 恢复）" if ok else info, None)
+                continue
+            if action == "__hold_down__":
+                ok, info = self.ctl.adb.press_down(kwargs.get("x"), kwargs.get("y"))
+                self.result_box[0] = (ok, "长按中（松开恢复）" if ok else info, None)
+                continue
+            if action == "__hold_up__":
+                ok, info = self.ctl.adb.press_up()
+                if ok:
+                    info = "已松开"
+                self.result_box[0] = (ok, info, None)
+                continue
             try:
                 ok, info = self.ctl.run_action(action, **kwargs)
                 if action == "connect":
@@ -429,13 +514,30 @@ class Overlay(QWidget):
             info += "   ⚠ 未连接（按 S 重试）"
         self._set_status(info, ok)
 
+    def _release_hold_blocking(self):
+        """退出前务必抬起：否则手机上会残留一个"一直按着"的手指。"""
+        if not (self.holding or self.hold_key):
+            return
+        self.holding = False
+        self.hold_key = False
+        try:
+            self.ctl.adb.press_up()
+        except Exception as exc:
+            log("[overlay] 释放长按失败: %s" % exc)
+
     def _quit(self):
         self.timer.stop()
+        self.press_timer.stop()
+        self.hold_timer.stop()
+        self._release_hold_blocking()
         self._pointer_restore_blocking()
         QApplication.quit()
 
     def closeEvent(self, event):
         self.timer.stop()
+        self.press_timer.stop()
+        self.hold_timer.stop()
+        self._release_hold_blocking()
         self._pointer_restore_blocking()
         super().closeEvent(event)
 

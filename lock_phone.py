@@ -173,6 +173,9 @@ def default_config():
         "brightness_key_repeat": 1,
         "warn_window_override": True,
         "swipe_duration": 160,
+        "long_press_ms": 600,
+        "long_press_hold_ms": 1200,
+        "long_press_max_ms": 4000,
         "left_click": "both",
         "panel_port": 59731,
         "panel_poll_seconds": 8,
@@ -584,6 +587,70 @@ class Adb(object):
             w, h = 1440, 3200
         return self.swipe(int(w * fx1), int(h * fy1), int(w * fx2), int(h * fy2), duration)
 
+    # -- 长按（倍速播放）-------------------------------------------
+
+    def supports_motionevent(self):
+        """
+        Android 11+ 的 input 支持 motionevent，可以真「按下 / 抬起」分开发。
+
+        这是长按能做「按住倍速、松开恢复」的前提；不支持就只能用同点 swipe 模拟。
+        结果缓存在实例上，避免每次长按都多跑一次 adb。
+        """
+        cached = getattr(self, "_motion_ok", None)
+        if cached is not None:
+            return cached
+        code, out = self._shell(["input"], timeout=10)
+        self._motion_ok = bool(code == 0 and "motionevent" in (out or ""))
+        return self._motion_ok
+
+    def press_down(self, x, y):
+        """按下不抬（配合 press_up 做长按/倍速）。"""
+        code, out = self._shell(
+            ["input", "motionevent", "DOWN", str(int(x)), str(int(y))], timeout=8)
+        if code != 0:
+            return False, (out or "").strip() or "按下失败"
+        self._press_xy = (int(x), int(y))
+        return True, "已按下 (%s,%s)" % (int(x), int(y))
+
+    def press_up(self, x=None, y=None):
+        """抬起。不传坐标就沿用上一次按下的位置。"""
+        if x is None or y is None:
+            pos = getattr(self, "_press_xy", None)
+            if not pos:
+                return False, "当前没有正在按下的手指"
+            x, y = pos
+        code, out = self._shell(
+            ["input", "motionevent", "UP", str(int(x)), str(int(y))], timeout=8)
+        self._press_xy = None
+        if code != 0:
+            return False, (out or "").strip() or "抬起失败"
+        return True, "已抬起 (%s,%s)" % (int(x), int(y))
+
+    def long_press(self, x, y, ms=800):
+        """在 (x,y) 长按 ms 毫秒（抖音/B站的倍速就是这么触发的）。"""
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        ms = max(100, int(ms))
+        if self.supports_motionevent():
+            ok, info = self.press_down(x, y)
+            if not ok:
+                return False, info
+            time.sleep(ms / 1000.0)
+            return self.press_up(x, y)
+        # 退化方案：起点终点相同的 swipe 等效于长按
+        ok, info = self.swipe(x, y, x, y, duration=ms)
+        if ok:
+            return True, "已长按 (%s,%s) %sms" % (int(x), int(y), ms)
+        return ok, info
+
+    def long_press_center(self, ms=800):
+        """长按屏幕正中（短视频的倍速播放就靠这个）。"""
+        w, h = self.display_size()
+        if not w or not h:
+            return False, "读不到分辨率，无法定位屏幕中心"
+        return self.long_press(w // 2, h // 2, ms)
+
     # -- 亮度 ------------------------------------------------------
 
     def get_brightness(self):
@@ -749,6 +816,11 @@ class Controller(object):
             return self.adb.swipe_ratio(0.5, 0.80, 0.5, 0.25, self.cfg.get("swipe_duration", 160))
         if name == "prev":
             return self.adb.swipe_ratio(0.5, 0.25, 0.5, 0.80, self.cfg.get("swipe_duration", 160))
+        if name in ("long-press", "speed"):
+            ms = kwargs.get("ms") or self.cfg.get("long_press_hold_ms", 1200)
+            if kwargs.get("x") is not None and kwargs.get("y") is not None:
+                return self.adb.long_press(kwargs["x"], kwargs["y"], ms)
+            return self.adb.long_press_center(ms)
         if name == "bright-up":
             return self.adb.brightness_key(+1, self.cfg.get("brightness_key_repeat", 1))
         if name == "bright-down":
@@ -942,6 +1014,8 @@ class TrayApp(object):
                 pystray.MenuItem("下一个（上滑）", lambda: self._fire("next", "刷视频")),
                 pystray.MenuItem("上一个（下滑）", lambda: self._fire("prev", "刷视频")),
                 pystray.MenuItem("播放 / 暂停", lambda: self._fire("play-pause", "播放")),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("倍速播放（长按屏幕中心）", lambda: self._fire("long-press", "倍速")),
             )),
             pystray.MenuItem("导航", pystray.Menu(
                 pystray.MenuItem("返回", lambda: self._fire("back", "导航")),
@@ -984,7 +1058,7 @@ class TrayApp(object):
             "bright-up": "亮度+", "bright-down": "亮度-", "home": "桌面", "back": "返回",
             "overlay": "映射层", "overlay-toggle": "映射层", "overlay-on": "映射层",
             "overlay-off": "映射层", "panel": "控制面板", "bright-get": "亮度",
-            "connect": "连接",
+            "connect": "连接", "long-press": "倍速", "speed": "倍速",
         }
         mapping = {}
         for hotkey, action in (self.cfg.get("actions") or {}).items():
@@ -1153,6 +1227,7 @@ MENU_ITEMS = [
     ("b", "返回键", "back"),
     ("h", "回到桌面", "home"),
     ("n", "通知栏", "key:83"),
+    ("v", "倍速播放（长按屏幕中心）", "long-press"),
     ("o", "切换映射层（全黑半透明）", "overlay-toggle"),
     ("k", "打开控制面板", "panel"),
     ("s", "查看连接状态", "status"),
@@ -1425,6 +1500,12 @@ def main(argv):
 
     if action in simple:
         ok, info = ctl.run_action(action)
+        say(("OK   " if ok else "FAIL ") + info)
+        return 0 if ok else 1
+
+    if action in ("long-press", "speed"):
+        ms = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else None
+        ok, info = ctl.run_action("long-press", **({"ms": ms} if ms else {}))
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 1
 

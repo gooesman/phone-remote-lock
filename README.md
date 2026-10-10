@@ -50,7 +50,7 @@
 ## 三、电脑端安装
 
 ```
-双击 setup.bat      # 建虚拟环境 + 装依赖（只跑一次，含 PySide6 约 150MB）
+双击 setup.bat      # 建虚拟环境 + 装依赖（只跑一次，含 PySide6-Essentials 约 120MB）
 ```
 
 启动方式：
@@ -181,6 +181,7 @@ D:\adb\platform-tools\adb.exe connect 192.168.1.23:42007
 - **亮度**：减 / 加 / 10% / 50% / 100%
 - **音量**：减小 / 增大 / 静音
 - **播放 / 刷视频**：上一个 / 播放暂停 / 下一个
+- **长按 / 倍速**：倍速（长按中心）/ 长按 3 秒 —— 抖音、B站的长按倍速就是这么触发的
 - **屏幕**：锁屏 / 唤醒 / 通知栏
 - **导航**：返回 / 桌面 / 任务切换
 - **映射层**：开启 / 关闭（按钮会显示当前状态）
@@ -231,6 +232,8 @@ D:\adb\platform-tools\adb.exe connect 192.168.1.23:42007
 |---|---|
 | **左键单击** | tap 点按 |
 | **左键拖动** | swipe 滑动（刷视频 / 翻页） |
+| **左键按住不动** | 长按（超过 `long_press_ms`，默认 600ms）→ 松开结束 |
+| **F（按住）** | 屏幕中心长按 = **倍速播放**，松开恢复原速 |
 | **滚轮向下 / 向上** | 下一个 / 上一个视频 |
 | **右键** | 返回键 |
 | **中键** | 回到桌面 |
@@ -244,6 +247,28 @@ D:\adb\platform-tools\adb.exe connect 192.168.1.23:42007
 | **R** | 重新读取分辨率（手机转过屏后用） |
 | **F11** | 全屏 / 窗口切换 |
 | **Esc** | 关闭映射层 |
+
+### 长按 / 倍速播放
+
+抖音、B站这类短视频的倍速是「**长按画面**」触发的（按住 2x，松开回 1x）。
+
+- 走的是 `input motionevent DOWN/UP`（Android 11+），是**真正的按住不放**，不是同点滑动模拟，
+  所以按住多久就倍速多久，松开立刻恢复。System 不支持时会自动退化成同点 `swipe` 长按。
+- **映射层里按 `F` 并按住**：直接在屏幕正中心长按（横屏/竖屏都按当前 `cur=` 尺寸取中点）。
+- **映射层里鼠标按住不动**：在光标所在位置长按，位置自己选（`F` 是固定的正中心快捷方式）。
+- **控制面板**里有「倍速（长按中心）」「长按 3 秒」两个按钮。
+- **托盘菜单**刷视频 → 倍速播放（长按屏幕中心）。
+- **命令行**：`lock_phone.py long-press`（默认 1.2 秒）或 `long-press 2000` 指定毫秒。
+- 自动抬起的兜底：按住超过 `long_press_max_ms`（默认 4 秒）会自动松手，
+  退出映射层时也一定会抬起，不会在手机上残留一个按下的手指。
+
+相关配置：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `long_press_ms` | 600 | 鼠标按住多久算长按 |
+| `long_press_hold_ms` | 1200 | 面板/热键触发时的长按时长（毫秒） |
+| `long_press_max_ms` | 4000 | 按住不放的自动松手上限 |
 
 透明度在 `config.json` 的 `overlay_alpha` 里调（0.05 近乎透明，1.0 全黑不透明）。
 不想要映射层时，用 `left_click: "panel"` 只留控制面板，或在托盘菜单里点「映射层 → 关闭」。
@@ -281,6 +306,8 @@ lock_phone.py bright-up         亮度 + （按系统亮度键的步长）
 lock_phone.py bright 60%        亮度设为 60%（绝对设置，持久化）
 lock_phone.py bright-get        查看当前亮度 + 是否有应用占用亮度覆盖
 lock_phone.py next / prev       下一个 / 上一个视频
+lock_phone.py long-press        长按屏幕中心 1.2 秒（倍速播放）
+lock_phone.py long-press 2500   长按 2.5 秒（毫秒自己定）
 lock_phone.py status            连接 / 屏幕 / 亮度 / 分辨率
 lock_phone.py swipe 540 2200 540 700 160
 lock_phone.py key 26            发任意 keycode
@@ -362,7 +389,10 @@ A：① 手机没开「无线调试」；② 不在同一 Wi-Fi；③ 端口变�
 跑 `lock_phone.py discover`，或托盘菜单点「重新连接」（会走 mDNS 自动发现）。
 
 **Q：映射层报缺少 PySide6**
-A：重跑 `setup.bat`，或 `.venv\Scripts\python.exe -m pip install PySide6`。
+A：重跑 `setup.bat`，或 `.venv\Scripts\python.exe -m pip install PySide6-Essentials`。
+（本项目只用 QtCore / QtGui / QtWidgets，`PySide6-Essentials` 就够，比完整 PySide6 省约 250MB；
+如果你之前装过完整版 PySide6，卸载后可能残留 Addons 文件——用 `pip uninstall` 不会删干净，
+可以按 pip 的 `RECORD` 清单核对残留。）
 （托管 Python 3.13 不带 tkinter，所以这里用 Qt 实现。）
 
 **Q：热键按了没反应**
@@ -382,7 +412,21 @@ A：说明手机端 adb 的 TLS 会话僵死了（网络本身可能是通的）
 A：手机离线时每次操作都要走重连流程。工具加了失败冷却（`retry_cooldown`，默认 4 秒），
 所以离线期间按钮会快速返回错误而不是卡住。手机在线时是 100-300ms 级别。
 
-## 十一、备选方案：不想要 adb 的话
+## 十一、体积与清理
+
+- `lock_phone.log` 超过 512KB 会自动清空重写，不用手动管。
+- 依赖只装 `PySide6-Essentials`（约 235MB 的 `.venv`），**不要装完整的 PySide6**——
+  完整版会带 WebEngine（单个 DLL 194MB）、Qt3D、Charts、Designer 等，本项目一个都用不到。
+- 如果之前装过完整版又卸掉了，**`pip uninstall` 不会删干净**，会残留 200MB+ 的孤儿 DLL。
+  核对办法（pip 的 `RECORD` 是权威清单）：
+
+  ```bat
+  :: 列出 site-packages/PySide6 下不属于任何已安装包的文件
+  .venv\Scripts\python.exe -c "import csv,os;sp=r'.venv\Lib\site-packages';owned={os.path.normpath(r[0]) for d in os.listdir(sp) if d.endswith('.dist-info') for r in csv.reader(open(os.path.join(sp,d,'RECORD'),encoding='utf-8',newline='')) if r};[print(os.path.join(sp,os.path.relpath(os.path.join(r,f),sp))) for r,_,fs in os.walk(os.path.join(sp,'PySide6')) for f in fs if os.path.normpath(os.path.relpath(os.path.join(r,f),sp)) not in owned]"
+  ```
+- 开发期的临时截图 / 诊断输出（`test-logs/`、`_tmp_*`、`shot_*.png`）都已清掉，这类文件记得别提交。
+
+## 十二、备选方案：不想要 adb 的话
 
 手机装 **MacroDroid**：
 1. 新建宏：触发器 = **HTTP Server Request**（或 Webhook）

@@ -35,8 +35,8 @@ echo [1/2] Creating virtual environment .venv ...
 if errorlevel 1 goto :fail
 
 :deps
-echo [2/2] Installing dependencies (pynput, pystray, Pillow, PySide6) ...
-echo       PySide6 is around 150 MB, this may take a couple of minutes.
+echo [2/2] Installing dependencies (pynput, pystray, Pillow, PySide6-Essentials) ...
+echo       PySide6-Essentials is around 120 MB, this may take a couple of minutes.
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 goto :fail
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt

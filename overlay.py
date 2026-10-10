@@ -64,11 +64,11 @@ C_BAD = QColor(255, 143, 143)
 
 HINTS_ARMED = [
     "映射中：左键=点按  拖动=滑动  按住不动=长按  滚轮=上/下视频  中键=桌面",
-    "←→=系统亮度   Shift+←→=App全屏亮度(滑动)   F按住=倍速   空格=播放暂停   Esc=退出",
+    "F=倍速开关  G=长按一下  ←→=系统亮度  Shift+←→=App亮度  Shift+↑↓=App音量  Esc=退出",
 ]
 HINTS_IDLE = [
     "按住鼠标右键 才开始映射（避免误触）    右键快按一下 = 返回",
-    "T=黑/白   [ ]=透明度   ←→=系统亮度   Shift+←→=App全屏亮度   Esc=退出",
+    "F=倍速开关  G=长按一下  T=黑/白  [ ]=透明度  U=解锁  S=状态  Esc=退出",
 ]
 
 
@@ -421,14 +421,15 @@ class Overlay(QWidget):
     # ---------------------------------------------------------- 长按 / 倍速
 
     def _hold_start(self):
-        """按住不动到阈值：在光标处按下不抬（短视频里就是倍速播放）。"""
+        """鼠标按住不动到阈值：开始"按住不放"（短视频里就是倍速）。"""
         if not self.armed or not self.drag_from or self.drag_moved or self.holding:
             return
         point = self.to_phone(*self.drag_from)
         if not point:
             return
         self.holding = True
-        self._enqueue("__hold_down__", x=point[0], y=point[1])
+        self._enqueue("__hold_down__",
+                      fx=point[0] / float(self.pw), fy=point[1] / float(self.ph))
         self.hold_timer.start(self.long_press_max_ms)   # 兜底：防止一直按住不放
 
     def _hold_end(self):
@@ -440,14 +441,9 @@ class Overlay(QWidget):
         if self.holding:
             self.holding = False
             self._enqueue("__hold_up__")
-            self._set_status("长按已达上限 %sms，已自动抬起" % self.long_press_max_ms, True)
+            self._set_status("长按已达上限 %sms，已自动松开" % self.long_press_max_ms, True)
 
     def keyReleaseEvent(self, event):
-        if event.key() == Qt.Key_F and not event.isAutoRepeat() and self.hold_key:
-            self.hold_key = False
-            self.hold_timer.stop()
-            self._enqueue("__hold_up__")
-            return
         super().keyReleaseEvent(event)
 
     def wheelEvent(self, event):
@@ -467,17 +463,23 @@ class Overlay(QWidget):
         if key == Qt.Key_Escape:
             self._quit()
         elif key == Qt.Key_Up:
-            self._enqueue("vol-up")
+            if event.modifiers() & Qt.ShiftModifier:
+                self._enqueue("app-vol-up")          # Shift+↑ = App 音量（右侧滑动）
+            else:
+                self._enqueue("vol-up")
         elif key == Qt.Key_Down:
-            self._enqueue("vol-down")
+            if event.modifiers() & Qt.ShiftModifier:
+                self._enqueue("app-vol-down")
+            else:
+                self._enqueue("vol-down")
         elif key == Qt.Key_Left:
             if event.modifiers() & Qt.ShiftModifier:
-                self._enqueue("app-bright-down")     # Shift+← = App 全屏亮度（滑动）
+                self._enqueue("app-bright-down")     # Shift+← = App 亮度（左侧滑动）
             else:
                 self._enqueue("bright-down")
         elif key == Qt.Key_Right:
             if event.modifiers() & Qt.ShiftModifier:
-                self._enqueue("app-bright-up")       # Shift+→ = App 全屏亮度（滑动）
+                self._enqueue("app-bright-up")
             else:
                 self._enqueue("bright-up")
         elif key == Qt.Key_Space:
@@ -505,11 +507,15 @@ class Overlay(QWidget):
         elif key == Qt.Key_BracketRight:
             self._bump_alpha(+0.05)
         elif key == Qt.Key_F:
-            # 按住 = 在屏幕中心保持长按（倍速播放），松开恢复
-            if not event.isAutoRepeat() and not self.hold_key:
-                self.hold_key = True
-                self._enqueue("__hold_center__")
-                self.hold_timer.start(self.long_press_max_ms)
+            # 倍速开关：按一下开（按住不放），再按一下关
+            if not event.isAutoRepeat():
+                self._enqueue("speed-toggle")
+        elif key == Qt.Key_G:
+            # 长按一下（同点 swipe，App 认这个）
+            if not event.isAutoRepeat():
+                self._enqueue("long-press-once")
+        elif key == Qt.Key_U:
+            self._enqueue("unlock")
         elif key == Qt.Key_F11:
             if self.isFullScreen():
                 self.showNormal()
@@ -614,24 +620,15 @@ class Overlay(QWidget):
                 else:
                     self.result_box[0] = (True, self._pointer_setup())
                 continue
-            if action == "__hold_center__":
-                # F 键：真按住（倍速），等 keyRelease 再抬
-                w, h = self.ctl.adb.display_size()
-                if not w or not h:
-                    self.result_box[0] = (False, "读不到分辨率，无法长按中心", None)
-                    continue
-                ok, info = self.ctl.adb.press_down(w // 2, h // 2)
-                self.result_box[0] = (ok, "倍速中（松开 F 恢复）" if ok else info, None)
-                continue
             if action == "__hold_down__":
-                ok, info = self.ctl.adb.press_down(kwargs.get("x"), kwargs.get("y"))
-                self.result_box[0] = (ok, "长按中（松开恢复）" if ok else info, None)
+                # 按住不放：DOWN + MOVE 心跳，等 __hold_up__ 才松手
+                ok, info = self.ctl.adb.hold_start(kwargs.get("fx", 0.5),
+                                                   kwargs.get("fy", 0.5))
+                self.result_box[0] = (ok, "按住中（倍速）" if ok else info, None)
                 continue
             if action == "__hold_up__":
-                ok, info = self.ctl.adb.press_up()
-                if ok:
-                    info = "已松开"
-                self.result_box[0] = (ok, info, None)
+                ok, info = self.ctl.adb.hold_stop()
+                self.result_box[0] = (True, "已松开" if ok else info, None)
                 continue
             try:
                 ok, info = self.ctl.run_action(action, **kwargs)
@@ -668,15 +665,16 @@ class Overlay(QWidget):
         self._set_status(info, ok)
 
     def _release_hold_blocking(self):
-        """退出前务必抬起：否则手机上会残留一个"一直按着"的手指。"""
-        if not (self.holding or self.hold_key):
-            return
+        """退出前务必松开：否则手机上会残留一个"一直按着"的手指。"""
         self.holding = False
         self.hold_key = False
         try:
-            self.ctl.adb.press_up()
+            if self.ctl.adb.is_holding():
+                self.ctl.adb.hold_stop()
+            else:
+                self.ctl.adb.press_up()
         except Exception as exc:
-            log("[overlay] 释放长按失败: %s" % exc)
+            log("[overlay] 释放按住失败: %s" % exc)
 
     def _stop_timers(self):
         for timer in (self.timer, self.press_timer, self.hold_timer,

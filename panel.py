@@ -31,7 +31,8 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lock_phone import (  # noqa: E402
-    Controller, default_config, load_config, log, save_config, tray_running,
+    MODES, Controller, apply_mode, default_config, load_config, log, save_config,
+    tray_running,
 )
 
 try:
@@ -49,6 +50,16 @@ except ImportError as exc:  # pragma: no cover
 import overlay as overlay_mod  # noqa: E402
 
 SECTIONS = [
+    ("播放 / 换视频", [
+        ("上一个", "prev", {}),
+        ("播放暂停", "play-pause", {}),
+        ("下一个", "next", {}),
+        ("点赞", "like", {}),
+    ]),
+    ("长按 / 倍速", [
+        ("倍速开关", "speed-toggle", {}),
+        ("长按一下", "long-press-once", {}),
+    ]),
     ("亮度 · 系统（退出全屏后生效）", [
         ("减", "bright-down", {}),
         ("加", "bright-up", {}),
@@ -56,33 +67,33 @@ SECTIONS = [
         ("50%", "bright", {"value": 128}),
         ("100%", "bright", {"value": 255}),
     ]),
-    ("亮度 · 当前 App 全屏（滑动调）", [
-        ("调暗", "app-bright-down", {}),
-        ("调亮", "app-bright-up", {}),
-    ]),
-    ("音量", [
+    ("音量 · 系统", [
         ("减小", "vol-down", {}),
         ("增大", "vol-up", {}),
         ("静音", "mute", {}),
     ]),
-    ("播放 / 刷视频", [
-        ("上一个", "prev", {}),
-        ("播放暂停", "play-pause", {}),
-        ("下一个", "next", {}),
+    ("全屏内滑动 · App 亮度（左侧）", [
+        ("调暗", "app-bright-down", {}),
+        ("调亮", "app-bright-up", {}),
     ]),
-    ("长按 / 倍速", [
-        ("倍速（长按中心）", "long-press", {}),
-        ("长按 3 秒", "long-press", {"ms": 3000}),
+    ("全屏内滑动 · App 音量（右侧）", [
+        ("减小", "app-vol-down", {}),
+        ("增大", "app-vol-up", {}),
+    ]),
+    ("横屏进度（左右滑）", [
+        ("后退", "seek-back", {}),
+        ("前进", "seek-forward", {}),
     ]),
     ("屏幕", [
         ("锁屏", "lock", {}),
         ("唤醒", "wake", {}),
-        ("通知栏", "key", {"keycode": 83}),
+        ("解锁", "unlock", {}),
     ]),
     ("导航", [
         ("返回", "back", {}),
         ("桌面", "home", {}),
         ("任务切换", "app-switch", {}),
+        ("通知栏", "key", {"keycode": 83}),
     ]),
 ]
 
@@ -430,7 +441,7 @@ class ControlPanel(QWidget):
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(8)
 
-        # 左上角：设置按钮
+        # 左上角：设置按钮 + 模式选择
         top = QHBoxLayout()
         top.setSpacing(6)
         gear = QPushButton("⚙ 设置")
@@ -438,8 +449,24 @@ class ControlPanel(QWidget):
         gear.setToolTip("设置全局快捷键绑定")
         gear.clicked.connect(self._open_settings)
         top.addWidget(gear)
+
+        self.mode_box = QComboBox()
+        self.mode_box.setToolTip("选当前在用的 App / 方向：换视频、暂停、倍速的手势都不一样")
+        for key, info in MODES.items():
+            self.mode_box.addItem(info.get("label", key), key)
+        current = self.host.cfg.get("mode") or "bili-portrait"
+        idx = self.mode_box.findData(current)
+        self.mode_box.setCurrentIndex(idx if idx >= 0 else 0)
+        self.mode_box.currentIndexChanged.connect(self._on_mode_changed)
+        top.addWidget(self.mode_box)
         top.addStretch(1)
         root.addLayout(top)
+
+        self.mode_hint = QLabel("")
+        self.mode_hint.setObjectName("dim")
+        self.mode_hint.setWordWrap(True)
+        root.addWidget(self.mode_hint)
+        self._refresh_mode_hint()
 
         title = QLabel("手机遥控")
         title.setObjectName("title")
@@ -503,6 +530,23 @@ class ControlPanel(QWidget):
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+    def _refresh_mode_hint(self):
+        key = self.host.cfg.get("mode") or "bili-portrait"
+        info = MODES.get(key) or {}
+        self.mode_hint.setText("当前模式：%s\n%s" % (info.get("label", key),
+                                                   info.get("hint", "")))
+
+    def _on_mode_changed(self, _index):
+        key = self.mode_box.currentData()
+        ok, info = apply_mode(self.host.cfg, key)
+        self._refresh_mode_hint()
+        if not ok:
+            self.set_status(info)
+            return
+        # 手势相关的配置变了，让常驻进程用上新参数
+        self.host.ctl = Controller(self.host.cfg)
+        self.set_status("%s（快捷键/按钮已按该模式生效）" % info)
 
     def _open_settings(self):
         """左上角「设置」：改快捷键绑定，保存后托盘自动重载。"""

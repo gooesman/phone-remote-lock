@@ -28,6 +28,12 @@ phone-remote-lock —— 把手机变成电脑的「遥控对象」：锁屏 / �
     python lock_phone.py home | back
     python lock_phone.py swipe 540 2200 540 700 160
     python lock_phone.py key 26              发送任意 keycode
+    python lock_phone.py mode                 看当前模式（B站竖屏/抖音/B站横屏）
+    python lock_phone.py mode douyin          切换模式（手势随模式变）
+    python lock_phone.py speed-toggle         倍速开关（按住不放，再按一次关闭）
+    python lock_phone.py long-press-once      长按一下（同点 swipe，App 认这个）
+    python lock_phone.py unlock               一键解锁（唤醒 + 上滑 + 可选 PIN）
+    python lock_phone.py next-video           下一个视频（横屏自动改为点「下一个」按钮）
     python lock_phone.py status               查看连接 / 屏幕 / 亮度
     python lock_phone.py connect              引导式输入 IP:端口 连接手机（双击 connect.bat）
     python lock_phone.py connect IP:PORT      直接连这个地址并记住
@@ -162,6 +168,60 @@ DEFAULT_ACTIONS = {
 }
 
 
+# ---------------------------------------------------------------- 模式
+#
+# 不同 App / 不同方向的手势完全不一样，用「模式」把这些差异收敛成一张表：
+# 面板上选一个模式 → 该模式覆盖下面这些动作的默认实现。
+#
+# 查到的实测规则（2026-10 核实）：
+#   抖音：上滑=下一个、下滑=上一个、单击=暂停、双击=点赞、
+#         长按任意处≈1s=倍速浮层(默认2x)、长按右侧1/5宽=按住期间2x；横屏里上滑照样换视频
+#   B站：竖屏上滑=下一个；横屏里 左右滑=进度、左侧上下滑=亮度、右侧上下滑=音量、双击=暂停、
+#         长按=倍速(~3x)；**横屏没有上下滑换视频的手势**，只能点控件里的「下一个」
+MODES = {
+    "bili-portrait": {
+        "label": "哔哩哔哩 · 竖屏",
+        "hint": "上滑 = 下一个视频    双击 = 暂停/播放    长按 = 倍速",
+        "app_bright_x": 0.12,      # 左侧上下滑 = 亮度
+        "app_vol_x": 0.88,         # 右侧上下滑 = 音量
+        "actions": {
+            "next": {"type": "swipe", "path": [0.5, 0.80, 0.5, 0.25]},
+            "prev": {"type": "swipe", "path": [0.5, 0.25, 0.5, 0.80]},
+            "play-pause": {"type": "double-tap"},
+            "like": {"type": "double-tap"},
+        },
+    },
+    "douyin": {
+        "label": "抖音 · 竖屏",
+        "hint": "上滑 = 下一个视频    单击 = 暂停/播放    双击 = 点赞    长按 = 倍速",
+        "app_bright_x": 0.12,
+        "app_vol_x": 0.88,
+        "actions": {
+            "next": {"type": "swipe", "path": [0.5, 0.80, 0.5, 0.25]},
+            "prev": {"type": "swipe", "path": [0.5, 0.25, 0.5, 0.80]},
+            "play-pause": {"type": "tap"},
+            "like": {"type": "double-tap"},
+        },
+    },
+    "bili-landscape": {
+        "label": "哔哩哔哩 · 横屏",
+        "hint": "左右滑 = 进度    左侧上下滑 = 亮度    右侧上下滑 = 音量    双击 = 暂停；"
+                "换视频点「下一个」按钮",
+        "app_bright_x": 0.12,
+        "app_vol_x": 0.88,
+        "actions": {
+            # 横屏没有上下滑换视频的手势 → 单击唤出控件、找「下一个」按钮点它
+            "next": {"type": "tap-node",
+                     "texts": ["下一个", "下一个视频", "下一集", "下一P"]},
+            "prev": {"type": "tap-node", "texts": ["上一个", "上一集"]},
+            "play-pause": {"type": "double-tap"},
+            "seek-forward": {"type": "swipe", "path": [0.35, 0.5, 0.75, 0.5]},
+            "seek-back": {"type": "swipe", "path": [0.75, 0.5, 0.35, 0.5]},
+        },
+    },
+}
+
+
 def default_config():
     return {
         "adb_path": "",
@@ -172,11 +232,15 @@ def default_config():
         "brightness_disable_auto": True,
         "brightness_key_repeat": 1,
         "warn_window_override": True,
-        "app_bright_x": 0.85,
+        "app_bright_x": 0.12,
         "app_bright_low": 0.38,
         "app_bright_high": 0.62,
         "app_bright_steps": 1,
         "app_bright_require_override": True,
+        "app_vol_x": 0.88,
+        "mode": "bili-portrait",
+        "speed_hold_max_ms": 120000,
+        "unlock_pin": "",
         "swipe_duration": 160,
         "long_press_ms": 600,
         "long_press_hold_ms": 1200,
@@ -226,6 +290,21 @@ def save_config(cfg):
             json.dump(cfg, fh, ensure_ascii=False, indent=2)
     except Exception as exc:
         log("写入配置失败: %s" % exc)
+
+
+def apply_mode(cfg, mode):
+    """切换使用模式，并把该模式的手势参数（亮度/音量竖线位置）一起落到配置里。"""
+    mode = (mode or "").strip()
+    if mode not in MODES:
+        return False, "未知模式：%s（可选：%s）" % (mode, " / ".join(MODES))
+    cfg["mode"] = mode
+    info = MODES[mode]
+    if info.get("app_bright_x") is not None:
+        cfg["app_bright_x"] = info["app_bright_x"]
+    if info.get("app_vol_x") is not None:
+        cfg["app_vol_x"] = info["app_vol_x"]
+    save_config(cfg)
+    return True, "已切到「%s」：%s" % (info.get("label", mode), info.get("hint", ""))
 
 
 def log(msg):
@@ -660,6 +739,197 @@ class Adb(object):
             return False, "读不到分辨率，无法定位屏幕中心"
         return self.long_press(w // 2, h // 2, ms)
 
+    def long_press_ratio(self, fx, fy, ms=1200):
+        """按比例长按。用「同点 swipe」实现——实测这个才是 App 认的长按。"""
+        w, h = self.display_size()
+        if not w or not h:
+            return False, "读不到分辨率"
+        x, y = int(w * fx), int(h * fy)
+        ok, info = self.swipe(x, y, x, y, duration=max(100, int(ms)))
+        if ok:
+            return True, "已长按 (%.2f,%.2f) %dms" % (fx, fy, ms)
+        return ok, info
+
+    # -- 按住不放（倍速开关用）-------------------------------------
+
+    def hold_start(self, fx=0.5, fy=0.5):
+        """
+        开始「按住不放」：DOWN 之后每隔一会儿补一个 MOVE 心跳。
+
+        为什么要心跳：只有单个 DOWN 时 App 的长按识别经常不触发
+        （两次独立 input 命令的 downTime 对不上），补 MOVE 让它看起来像真手指。
+        必须配 hold_stop() 收尾，否则手机上会残留一个按下的手指。
+        """
+        if getattr(self, "_holding", False):
+            return True, "已经在按住状态"
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        w, h = self.display_size()
+        if not w or not h:
+            return False, "读不到分辨率"
+        x, y = int(w * fx), int(h * fy)
+        ok, info = self.press_down(x, y)
+        if not ok:
+            return False, info
+        self._holding = True
+        self._hold_xy = (x, y)
+        self._hold_stop_flag = threading.Event()
+        self._hold_thread = threading.Thread(
+            target=self._hold_heartbeat, args=(x, y, self._hold_stop_flag), daemon=True)
+        self._hold_thread.start()
+        # 兜底：一直按住不放太久会自动松开，避免手机上残留按下的手指
+        limit = int(self.cfg.get("speed_hold_max_ms", 120000) or 0)
+        if limit > 0:
+            threading.Thread(target=self._hold_watchdog,
+                             args=(self._hold_stop_flag, limit), daemon=True).start()
+        return True, "已开始按住 (%.2f,%.2f)（倍速中）" % (fx, fy)
+
+    def _hold_watchdog(self, stop_flag, limit_ms):
+        if not stop_flag.wait(limit_ms / 1000.0) and self.is_holding():
+            log("[adb] 按住超过 %sms，自动松开" % limit_ms)
+            self.hold_stop()
+
+    def _hold_heartbeat(self, x, y, stop_flag):
+        """按住期间反复补 MOVE：偏移 1px 来回抖，看起来像手指微动。"""
+        offset = 0
+        while not stop_flag.wait(0.5):
+            offset = 1 - offset
+            self._shell(["input", "motionevent", "MOVE",
+                         str(x + offset), str(y + offset)], timeout=6)
+
+    def hold_stop(self):
+        """结束「按住不放」。没在按住时返回 False，避免发出多余的 UP。"""
+        if not getattr(self, "_holding", False):
+            return False, "当前没有处于按住状态"
+        flag = getattr(self, "_hold_stop_flag", None)
+        if flag is not None:
+            flag.set()
+        self._holding = False
+        x, y = getattr(self, "_hold_xy", (None, None))
+        return self.press_up(x, y)
+
+    def is_holding(self):
+        return bool(getattr(self, "_holding", False))
+
+    # -- 屏幕坐标小工具 --------------------------------------------
+
+    def tap_ratio(self, fx, fy):
+        w, h = self.display_size()
+        if not w or not h:
+            return False, "读不到分辨率"
+        return self.tap(int(w * fx), int(h * fy))
+
+    def double_tap_ratio(self, fx=0.5, fy=0.5, gap=0.09):
+        """双击（抖音点赞、B站播放/暂停都是双击）。"""
+        w, h = self.display_size()
+        if not w or not h:
+            return False, "读不到分辨率"
+        x, y = int(w * fx), int(h * fy)
+        ok, info = self.tap(x, y)
+        if not ok:
+            return False, info
+        time.sleep(gap)
+        ok, info = self.tap(x, y)
+        return (True, "已双击 (%.2f,%.2f)" % (fx, fy)) if ok else (ok, info)
+
+    # -- 找屏幕上的按钮（横屏换视频等）-----------------------------
+
+    def dump_ui(self):
+        """把当前界面的 UI 树 dump 下来（uiautomator），返回 XML 文本。"""
+        self._shell(["uiautomator", "dump", "/sdcard/window_dump.xml"], timeout=20)
+        code, out = self._shell(["cat", "/sdcard/window_dump.xml"], timeout=20)
+        return out if code == 0 else ""
+
+    def find_node(self, texts, descs=()):
+        """在 UI 树里按 text / content-desc 找节点，返回 (x, y, 匹配到的词)。"""
+        xml = self.dump_ui()
+        if not xml or "<hierarchy" not in xml:
+            return None
+        wanted = [t for t in list(texts) + list(descs) if t]
+        for node in re.findall(r"<node[^>]*>", xml):
+            text = re.search(r'\btext="([^"]*)"', node)
+            desc = re.search(r'content-desc="([^"]*)"', node)
+            bounds = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+            if not bounds:
+                continue
+            values = [g for g in (text.group(1) if text else "",
+                                  desc.group(1) if desc else "") if g]
+            for want in wanted:
+                if any(want == v or want in v for v in values):
+                    x1, y1, x2, y2 = (int(bounds.group(i)) for i in range(1, 5))
+                    if x2 > x1 and y2 > y1:
+                        return ((x1 + x2) // 2, (y1 + y2) // 2, want)
+        return None
+
+    def tap_node(self, texts, descs=(), show_controls=True):
+        """点 UI 上某个按钮（例如横屏播放器里的「下一个」）。"""
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        if show_controls:
+            w, h = self.display_size()
+            if w and h:
+                self.tap(w // 2, h // 2)   # 单击唤出播放控件
+                time.sleep(0.6)
+        found = self.find_node(texts, descs)
+        if not found:
+            return False, "界面上没找到这些按钮：%s" % "/".join(texts)
+        x, y, matched = found
+        ok, info = self.tap(x, y)
+        if ok:
+            return True, "已点击「%s」(%d,%d)" % (matched, x, y)
+        return ok, info
+
+    # -- 锁屏 / 解锁 -----------------------------------------------
+
+    def is_locked(self):
+        """当前是否还在锁屏界面（两种判据都看一眼）。"""
+        code, out = self._shell(["dumpsys", "window"], timeout=20)
+        if code != 0 or not out:
+            return None
+        if re.search(r"mDreamingLockscreen=true", out):
+            return True
+        focus = re.findall(r"mCurrentFocus=.*?\s([\w.]+/[\w.$]+)", out)
+        if focus:
+            top = focus[-1]
+            return top.startswith("com.android.systemui") and (
+                "StatusBar" in top or "keyguard" in top.lower())
+        return None
+
+    def unlock(self, pin=None):
+        """
+        一键解锁：唤醒 → 上滑 → （配置了 PIN 就）输入 PIN 并回车。
+
+        ⚠ 安全锁屏（PIN/密码）对「注入文本」的限制因 ROM 而异，
+        本函数会复查是否真的解开了，没解开就如实返回。
+        """
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        self.send_keyevent(self.cfg.get("wake_keyevent", 224))   # 先唤醒
+        time.sleep(0.4)
+        self.swipe_ratio(0.5, 0.86, 0.5, 0.28, duration=180)     # 上滑密码盘
+        time.sleep(0.7)
+        if self.is_locked() is False:
+            return True, "已解锁（没有设置安全锁）"
+        if not pin:
+            return False, ("上滑后仍在锁屏：这台手机设了安全锁，"
+                           "请在 config.json 里填 unlock_pin（你的锁屏数字密码）")
+        code, out = self._shell(["input", "text", str(pin)], timeout=10)
+        if code != 0:
+            return False, "注入密码失败: %s" % (out or "").strip()
+        time.sleep(0.3)
+        self.send_keyevent(66)                                   # 回车
+        time.sleep(0.8)
+        locked = self.is_locked()
+        if locked is False:
+            return True, "已解锁（PIN 注入成功）"
+        if locked is None:
+            return True, "唤醒 + 已上滑并输入 PIN（读不到锁屏状态，请看一眼手机）"
+        return False, ("输入 PIN 后仍在锁屏：这个 ROM 挡住了注入文本。"
+                       "建议改用小米的「蓝牙设备解锁」或 Smart Lock（贴身解锁）")
+
     # -- 亮度 ------------------------------------------------------
 
     def get_brightness(self):
@@ -764,7 +1034,7 @@ class Adb(object):
                            "先让视频进全屏再调；确实要发可以在 config.json 里把 "
                            "app_bright_require_override 设为 false")
 
-        x = float(self.cfg.get("app_bright_x", 0.85))
+        x = float(self.cfg.get("app_bright_x") or 0.12)
         low = float(self.cfg.get("app_bright_low", 0.38))
         high = float(self.cfg.get("app_bright_high", 0.62))
         steps = max(1, int(steps))
@@ -776,13 +1046,33 @@ class Adb(object):
             if not ok:
                 return False, info
             time.sleep(0.12)
-        msg = "App 亮度%s（全屏内滑动 %d 次）" % (
-            "调高" if direction > 0 else "调低", steps)
+        msg = "App 亮度%s（%.0f%% 竖线滑动 %d 次）" % (
+            "调高" if direction > 0 else "调低", x * 100, steps)
         if override:
             msg += "｜%s 正在占用窗口亮度" % override
         else:
             msg += "｜没有 App 占用窗口亮度（app_bright_require_override 已关闭，照样发出）"
         return True, msg
+
+    def app_volume_gesture(self, direction=1, steps=1):
+        """模拟 App 自己的音量手势（B站横屏右侧上下滑），同样不动系统音量。"""
+        ok, info = self.ready()
+        if not ok:
+            return False, info
+        x = float(self.cfg.get("app_vol_x") or 0.88)
+        low = float(self.cfg.get("app_bright_low", 0.38))
+        high = float(self.cfg.get("app_bright_high", 0.62))
+        steps = max(1, int(steps))
+        for _ in range(steps):
+            if direction > 0:
+                ok, info = self.swipe_ratio(x, high, x, low, duration=180)
+            else:
+                ok, info = self.swipe_ratio(x, low, x, high, duration=180)
+            if not ok:
+                return False, info
+            time.sleep(0.12)
+        return True, "App 音量%s（%.0f%% 竖线滑动 %d 次）" % (
+            "调高" if direction > 0 else "调低", x * 100, steps)
 
     # -- 状态 ------------------------------------------------------
 
@@ -858,9 +1148,50 @@ class Controller(object):
         self.cfg = cfg
         self.adb = Adb(cfg)
 
+    # -- 模式 ------------------------------------------------------
+
+    def mode(self):
+        return (self.cfg.get("mode") or "bili-portrait").strip()
+
+    def mode_info(self):
+        return MODES.get(self.mode()) or MODES["bili-portrait"]
+
+    def _mode_spec(self, action):
+        return (self.mode_info().get("actions") or {}).get(action)
+
+    def _run_gesture(self, spec):
+        """按模式表里的一条手势规格执行。"""
+        kind = (spec or {}).get("type")
+        adb = self.adb
+        if kind == "swipe":
+            path = spec.get("path") or [0.5, 0.8, 0.5, 0.25]
+            ok, info = adb.swipe_ratio(*path, duration=spec.get("duration", 180))
+            return (True, "已滑动 %s" % ("→".join("%.2f" % v for v in path))) if ok else (ok, info)
+        if kind == "tap":
+            return adb.tap_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5))
+        if kind == "double-tap":
+            return adb.double_tap_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5))
+        if kind == "long-press":
+            return adb.long_press_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5),
+                                        spec.get("ms", self.cfg.get("long_press_hold_ms", 1200)))
+        if kind == "tap-node":
+            return adb.tap_node(spec.get("texts") or [], spec.get("descs") or [])
+        return False, "模式表里有不认识的手势类型: %s" % kind
+
     def run_action(self, name, **kwargs):
         """执行动作，返回 (ok, message)。"""
         name = (name or "").strip().lower().replace("_", "-")
+        if name == "next-video":
+            name = "next"          # 横屏模式的「下一个视频」就是点按钮
+        if name == "mode":
+            return apply_mode(self.cfg, kwargs.get("value") or kwargs.get("mode"))
+
+        # 模式表优先：同一个「下一个视频」在竖屏是上滑、在横屏是点按钮
+        if name not in ("connect", "panel", "overlay-on", "overlay-off",
+                        "overlay-toggle", "status", "mode"):
+            spec = self._mode_spec(name)
+            if spec is not None:
+                return self._run_gesture(spec)
 
         if name == "lock":
             return self.adb.send_keyevent(self.cfg.get("lock_keyevent", 223))
@@ -879,6 +1210,31 @@ class Controller(object):
             if kwargs.get("x") is not None and kwargs.get("y") is not None:
                 return self.adb.long_press(kwargs["x"], kwargs["y"], ms)
             return self.adb.long_press_center(ms)
+        if name == "long-press-once":
+            # 保留的「按一下长按」：同点 swipe，实测 App 认这个
+            ms = kwargs.get("ms") or self.cfg.get("long_press_hold_ms", 1200)
+            return self.adb.long_press_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5), ms)
+        if name in ("speed-on", "speed-toggle", "speed-off"):
+            # 倍速开关：按住不放（带 MOVE 心跳），再按一次才松开
+            if name == "speed-off" or self.adb.is_holding():
+                ok, info = self.adb.hold_stop()
+                return (True, "倍速已关（已松开）") if ok else (ok, info)
+            ok, info = self.adb.hold_start(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
+            return (True, "倍速已开（按住中）· 再按一次关闭") if ok else (ok, info)
+        if name in ("like", "double-tap"):
+            return self.adb.double_tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
+        if name in ("seek-forward", "seek-back"):
+            if name == "seek-forward":
+                return self.adb.swipe_ratio(0.35, 0.5, 0.75, 0.5, 180)
+            return self.adb.swipe_ratio(0.75, 0.5, 0.35, 0.5, 180)
+        if name in ("app-vol-up", "app-vol-down"):
+            return self.adb.app_volume_gesture(
+                +1 if name.endswith("up") else -1,
+                kwargs.get("steps") or self.cfg.get("app_bright_steps", 1))
+        if name == "unlock":
+            return self.adb.unlock((self.cfg.get("unlock_pin") or "").strip() or None)
+        if name in ("tap-xy",):
+            return self.adb.tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
         if name == "bright-up":
             return self.adb.brightness_key(+1, self.cfg.get("brightness_key_repeat", 1))
         if name == "bright-down":
@@ -1058,6 +1414,7 @@ class TrayApp(object):
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("锁定手机", lambda: self._fire("lock", "锁屏")),
             pystray.MenuItem("唤醒屏幕", lambda: self._fire("wake", "唤醒")),
+            pystray.MenuItem("解锁手机（唤醒+上滑+PIN）", lambda: self._fire("unlock", "解锁")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("映射层（手机矩形）", pystray.Menu(
                 pystray.MenuItem("开启", lambda: self._fire("overlay-on", "映射层")),
@@ -1078,16 +1435,32 @@ class TrayApp(object):
                 pystray.MenuItem("中等 (50%)", lambda: self._fire("bright", "亮度", value=128)),
                 pystray.MenuItem("最亮 (100%)", lambda: self._fire("bright", "亮度", value=255)),
             )),
-            pystray.MenuItem("App 亮度（全屏里滑动调）", pystray.Menu(
-                pystray.MenuItem("调高 +", lambda: self._fire("app-bright-up", "App 亮度")),
-                pystray.MenuItem("调低 -", lambda: self._fire("app-bright-down", "App 亮度")),
+            pystray.MenuItem("App 内滑动（全屏时用）", pystray.Menu(
+                pystray.MenuItem("亮度 +（左侧上滑）", lambda: self._fire("app-bright-up", "App 亮度")),
+                pystray.MenuItem("亮度 -（左侧下滑）", lambda: self._fire("app-bright-down", "App 亮度")),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("音量 +（右侧上滑）", lambda: self._fire("app-vol-up", "App 音量")),
+                pystray.MenuItem("音量 -（右侧下滑）", lambda: self._fire("app-vol-down", "App 音量")),
             )),
+            pystray.MenuItem("使用模式", pystray.Menu(*[
+                pystray.MenuItem(info.get("label", key),
+                                 lambda _i=None, m=key: self._fire("mode", "模式", value=m),
+                                 checked=lambda item, m=key: (self.cfg.get("mode") or "") == m,
+                                 radio=True)
+                for key, info in MODES.items()
+            ])),
             pystray.MenuItem("刷视频", pystray.Menu(
                 pystray.MenuItem("下一个（上滑）", lambda: self._fire("next", "刷视频")),
                 pystray.MenuItem("上一个（下滑）", lambda: self._fire("prev", "刷视频")),
                 pystray.MenuItem("播放 / 暂停", lambda: self._fire("play-pause", "播放")),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("倍速播放（长按屏幕中心）", lambda: self._fire("long-press", "倍速")),
+            )),
+            pystray.MenuItem("长按 / 倍速", pystray.Menu(
+                pystray.MenuItem("倍速开关（按住不放）",
+                                 lambda: self._fire("speed-toggle", "倍速")),
+                pystray.MenuItem("长按一下（按一次长按）",
+                                 lambda: self._fire("long-press-once", "长按")),
             )),
             pystray.MenuItem("导航", pystray.Menu(
                 pystray.MenuItem("返回", lambda: self._fire("back", "导航")),
@@ -1132,6 +1505,10 @@ class TrayApp(object):
             "overlay-off": "映射层", "panel": "控制面板", "bright-get": "亮度",
             "connect": "连接", "long-press": "倍速", "speed": "倍速",
             "app-bright-up": "App亮度", "app-bright-down": "App亮度",
+            "app-vol-up": "App音量", "app-vol-down": "App音量",
+            "unlock": "解锁", "speed-on": "倍速开", "speed-off": "倍速关",
+            "speed-toggle": "倍速开关", "long-press-once": "长按", "like": "点赞",
+            "seek-forward": "快进", "seek-back": "快退", "mode": "模式",
         }
         mapping = {}
         for hotkey, action in (self.cfg.get("actions") or {}).items():
@@ -1302,7 +1679,9 @@ MENU_ITEMS = [
     ("b", "返回键", "back"),
     ("h", "回到桌面", "home"),
     ("n", "通知栏", "key:83"),
-    ("v", "倍速播放（长按屏幕中心）", "long-press"),
+    ("v", "倍速开关（按住不放，再按关闭）", "speed-toggle"),
+    ("g", "长按一下（1.2 秒）", "long-press-once"),
+    ("u", "解锁手机", "unlock"),
     ("o", "切换映射层（手机矩形）", "overlay-toggle"),
     ("k", "打开控制面板", "panel"),
     ("s", "查看连接状态", "status"),
@@ -1570,6 +1949,9 @@ def main(argv):
         "play-pause": {}, "next-track": {}, "prev-track": {}, "home": {}, "back": {},
         "app-switch": {}, "next": {}, "prev": {}, "bright-up": {}, "bright-down": {},
         "app-bright-up": {}, "app-bright-down": {},
+        "app-vol-up": {}, "app-vol-down": {}, "unlock": {}, "like": {},
+        "speed-on": {}, "speed-off": {}, "speed-toggle": {}, "long-press-once": {},
+        "seek-forward": {}, "seek-back": {}, "next-video": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {},
     }
@@ -1578,6 +1960,20 @@ def main(argv):
         ok, info = ctl.run_action(action)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 1
+
+    if action == "mode":
+        if len(argv) < 3:
+            key = ctl.mode()
+            info = ctl.mode_info()
+            say("当前模式: %s（%s）" % (key, info.get("label", key)))
+            say("        %s" % info.get("hint", ""))
+            say("可用: %s" % " / ".join(MODES))
+            return 0
+        ok, info = apply_mode(cfg, argv[2])
+        say(("OK   " if ok else "FAIL ") + info)
+        if ok:
+            ctl = Controller(cfg)
+        return 0 if ok else 2
 
     if action in ("long-press", "speed"):
         ms = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else None
@@ -1681,7 +2077,9 @@ def main(argv):
         say("未知命令: %s" % action)
         say("可用: lock / wake / vol-up / vol-down / mute / play-pause / next / prev /")
         say("      bright-up / bright-down / bright <值> / swipe / tap / key /")
-        say("      status / connect [IP:PORT] / discover / pair")
+        say("      status / connect [IP:PORT] / discover / pair / mode [key] /")
+        say("      speed-toggle / long-press-once / unlock / like / app-bright-up /")
+        say("      app-vol-up / seek-forward / next-video")
         return 2
 
     if not single_instance():

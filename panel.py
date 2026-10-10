@@ -472,7 +472,7 @@ class ControlPanel(QWidget):
         self.more_button = QToolButton()
         self.more_button.setText("更多功能 ▾")
         self.more_button.setPopupMode(QToolButton.InstantPopup)
-        self.more_button.setToolTip("安装 APK、映射层尺寸、摸鱼模式、输入地址…这些不常用的都在这儿")
+        self.more_button.setToolTip("安装 APK、映射层尺寸、手机鼠标光标、输入地址…这些不常用的都在这儿")
         self.more_button.setMenu(self._build_more_menu())
         top.addWidget(self.more_button)
 
@@ -583,11 +583,6 @@ class ControlPanel(QWidget):
             size_menu.addAction(act)
 
         menu.addSeparator()
-        act = QAction("摸鱼模式（无窗口）", self)
-        act.setToolTip("屏幕上什么都不显示，按住鼠标右键才开始控制手机")
-        act.triggered.connect(lambda: self.host.fire("covert"))
-        menu.addAction(act)
-
         self.mouse_action = QAction("手机鼠标光标（鼠标源注入）", self)
         self.mouse_action.setCheckable(True)
         self.mouse_action.setChecked(self.host.ctl.adb.is_mouse_mode())

@@ -293,15 +293,6 @@ def default_config():
         "retry_cooldown": 4.0,
         "ensure_ttl": 5,
         "input_source": "touchscreen",
-        "covert_move_rate": 25,
-        "covert_suppress": True,
-        "covert_wake_on_arm": True,
-        "covert_osd": False,
-        "covert_area": "ratio",
-        "covert_guide": True,
-        "covert_guide_alpha": 0.3,
-        "covert_guide_cross": True,
-        "covert_clip": True,
         "overlay_move_rate": 20,
         "apk_grant_permissions": True,
         "apk_push_fallback": True,
@@ -1011,7 +1002,7 @@ class Adb(object):
                 size = (int(found.group(1)), int(found.group(2)))
                 self._size_cache = (size, time.time())
                 if list(size) != list(self.cfg.get("last_display_size") or []):
-                    # 记下来：下次新开的进程（比如摸鱼模式）可以先用它，不用等 dumpsys
+                    # 记下来：下次新开的进程可以先用它，不用等 dumpsys
                     self.cfg["last_display_size"] = list(size)
                     save_config(self.cfg)
                 return size
@@ -1873,23 +1864,6 @@ class Controller(object):
             return self.adb.uninstall_package(kwargs.get("package") or kwargs.get("pkg"))
         if name in ("launch-app", "launch"):
             return self.adb.launch_package(kwargs.get("package") or kwargs.get("pkg"))
-        if name in ("covert", "covert-toggle"):
-            script = os.path.join(HERE, "covert.py")
-            exe = sys.executable
-            pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-            if os.path.isfile(pyw):
-                exe = pyw
-            flags = 0x00000008 | NO_WINDOW if os.name == "nt" else 0
-            running = False
-            try:
-                with socket.create_connection(("127.0.0.1", 59732), timeout=0.6):
-                    running = True
-            except Exception:
-                running = False
-            subprocess.Popen([exe, script] + (["--stop"] if running else []),
-                             cwd=HERE, creationflags=flags)
-            return True, ("摸鱼模式已关闭" if running else
-                          "摸鱼模式已开启：屏幕上不显示任何窗口，按住鼠标右键才开始控制手机")
         if name == "overlay-size":
             return set_overlay_size(self.cfg, kwargs.get("value"))
         if name in ("set-input-source", "mouse-mode"):
@@ -2098,8 +2072,6 @@ class TrayApp(object):
                              lambda: self._fire("install-apk", "安装 APK",
                                                 path=self.cfg.get("last_apk") or "")),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("摸鱼模式（无窗口，按住右键控制手机）",
-                             lambda: self._toggle_covert()),
             pystray.MenuItem("映射层大小", pystray.Menu(*[
                 pystray.MenuItem(label, lambda _i=None, m=key: self._fire("overlay-size", "尺寸",
                                                                           value=m),
@@ -2167,32 +2139,6 @@ class TrayApp(object):
             pystray.MenuItem("退出", self._quit),
         ]
         return pystray.Menu(*items)
-
-    def _toggle_covert(self):
-        """摸鱼模式：无窗口的后台进程，按住右键时才把鼠标交给手机。"""
-        script = os.path.join(HERE, "covert.py")
-        if not os.path.isfile(script):
-            self._notify("没找到 covert.py", "摸鱼模式")
-            return
-        import socket as _socket
-        running = False
-        try:
-            with _socket.create_connection(("127.0.0.1", 59732), timeout=0.6):
-                running = True
-        except Exception:
-            running = False
-        exe = sys.executable
-        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-        if os.path.isfile(pyw):
-            exe = pyw
-        flags = 0x00000008 | NO_WINDOW if os.name == "nt" else 0
-        try:
-            subprocess.Popen([exe, script] + (["--stop"] if running else []),
-                             cwd=HERE, creationflags=flags)
-            self._notify("摸鱼模式已关闭" if running else
-                         "摸鱼模式已开启：按住右键控制手机，Ctrl+Alt+Q 退出", "摸鱼模式")
-        except Exception as exc:
-            log("切换摸鱼模式失败: %s" % exc)
 
     def _quit(self, *_args):
         try:
@@ -2689,15 +2635,10 @@ def main(argv):
         "speed-on": {}, "speed-off": {}, "speed-toggle": {}, "long-press-once": {},
         "seek-forward": {}, "seek-back": {}, "next-video": {},
         "install-apk": {}, "uninstall-apk": {}, "launch-app": {},
-        "mouse-mode": {}, "overlay-size": {}, "covert": {},
+        "mouse-mode": {}, "overlay-size": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {},
     }
-
-    if action in simple:
-        ok, info = ctl.run_action(action)
-        say(("OK   " if ok else "FAIL ") + info)
-        return 0 if ok else 1
 
     if action == "overlay-size":
         name = argv[2] if len(argv) > 2 else ""
@@ -2707,6 +2648,11 @@ def main(argv):
         ok, info = set_overlay_size(cfg, name)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 2
+
+    if action in simple:
+        ok, info = ctl.run_action(action)
+        say(("OK   " if ok else "FAIL ") + info)
+        return 0 if ok else 1
 
     if action in ("install-apk", "install"):
         path = argv[2] if len(argv) > 2 else ""

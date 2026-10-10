@@ -275,8 +275,8 @@ D:\adb\platform-tools\adb.exe connect 192.168.1.23:42007
 | 方案 | 成本 | 说明 |
 |---|---|---|
 | 支持多设备切换的蓝牙鼠标 | 几十块 | 按切换键连到手机即可，原生光标、原生悬停、延迟最低。缺点是同一时刻鼠标只服务一台设备 |
-| **ESP32 做 BLE HID 鼠标桥**（推荐给"电脑鼠标控制手机"） | 30–50 元 | ESP32 被手机认成真鼠标 → **手机出现原生光标**；电脑通过串口/WiFi 把"移动/左键/滚轮"发给它。电脑鼠标照常控制电脑，ESP32 是第二只"虚拟鼠标"，可同时用；延迟 10–20ms，比 adb 更低，且不怕无线调试掉线 |
-| Windows 自己当 BLE HID 外设 | 0 | 理论上 WinRT 支持 GATT server + HID over GATT，但需要蓝牙适配器支持 peripheral 角色、要手写 HOGP 描述符、各 ROM 配对/重连兼容性差 —— **不建议**，macOS/Linux 有现成工具，Windows 生态很弱 |
+| **ESP32 做 BLE HID 鼠标桥** | 30–50 元 | 同样能拿原生光标，但要多一块硬件；纯软件用 `scrcpy --otg` 就够了 |
+| Windows 自己当 BLE HID 外设 | 0 | 理论可行、兼容性存疑（详见「蓝牙能不能走」） |
 
 现阶段的折中：映射层里画**橙色小球**给你瞄准（加上矩形内坐标），手机上靠位置感知。
 
@@ -598,13 +598,51 @@ lock_phone.py key 26            发任意 keycode
 | 本工具（无线 adb + 常驻通道） | 传输 6ms + 注入 25-70ms | 无 | 无 | 0 |
 | 本工具 + **USB 数据线**（插上自动优先） | 省几 ms，主要是更稳 | 无 | 无 | 一条线 |
 | **scrcpy**（已随工具安装） | **1-5 ms**（常驻 server + socket） | 无 | **有** | 0 |
-| **scrcpy --otg** | **<1 ms**（USB HID） | **有** | 无 | USB 线 |
-| ESP32-S3 USB HID 桥 | <1 ms | **有** | 无 | ~¥25 |
-| ESP32 蓝牙 HID 桥 | 10-20 ms | **有** | 无 | ~¥25 |
+| **`scrcpy --otg`**（纯软件，推荐） | **<1 ms**（USB HID） | **有原生光标** | 无 | 一根**数据线** |
+| 蓝牙：电脑当 HID 外设 | 看适配器 | 有（若配对成功） | 无 | 0，兼容性存疑（见下） |
 
 - **想看得见 + 低延迟** → `scrcpy_run.bat`。
-- **想在手机屏幕上看到鼠标指针** → 只能让手机"看见鼠标设备"：真蓝牙鼠标 / `scrcpy --otg` /
-  ESP32 HID 桥（注入事件永远不会画光标，实测 `mMouseInfoMap` 一直是 `<EMPTY>`）。
+- **想在手机屏幕上看到鼠标指针** → 注入事件永远做不到（实测 `mMouseInfoMap` 一直是 `<EMPTY>`），
+  纯软件的办法只有 **`scrcpy --otg`**。
+
+### 让手机显示鼠标光标（纯软件，scrcpy --otg）
+
+`scrcpy --otg` 让**电脑直接扮演 USB HID 鼠标**，手机把它当成一只真鼠标，
+于是**出现原生光标**（就是你用扩展坞插鼠标时看到的那种），延迟 <1ms：
+
+```bat
+"%USERPROFILE%\WorkBuddy\xiaomi\.workbuddy\tools\scrcpy\scrcpy-win64-v5.0.1\scrcpy.exe" --otg
+```
+
+⚠️ 下面三件事齐了它才能跑（缺一件就会直接报错退出）：
+
+1. **一根能传数据的数据线，手机直连电脑**。不要走扩展坞 —— 扩展坞是让**手机当主机**，
+   电脑看不到它（所以 `adb devices` 里只有无线、没有 USB 设备）；
+2. 手机：**开发者选项 → USB 调试**打开（和"无线调试"是**两个独立开关**）、
+   USB 用途选**传输文件**、并允许"允许 USB 调试"；
+3. **给 Windows 装 ADB 驱动**（这步最容易漏）：platform-tools 里只有 `AdbWinApi.dll`、
+   **没有 `.inf`**，所以插上线 Windows 也不会把手机交给 adb。
+   用 **Zadig** 装：Options → List All Devices → 选 Android Composite ADB Interface
+   （或 Unknown Device）→ 驱动选 **WinUSB** → Install Driver。
+
+装好之后有三重好处：`adb devices` 里出现 USB 序列号（本工具**自动优先走 USB**，更稳更快）、
+scrcpy 有线投屏更稳、**`scrcpy --otg` 给你原生光标**（电脑鼠标直接操作手机）。
+
+> `scrcpy --otg` 启动时会**先 kill 掉 adb server**（它要独占 USB 通道），
+> 用之前先退出本工具和普通 scrcpy。
+
+### 蓝牙能不能走？——是角色问题
+
+你记得的"平板连无线鼠标也有光标"，那是**平板当主机（host）、鼠标当外设（peripheral）**。
+我们要的是反过来的：**电脑当外设、手机当主机**，手机才会画出光标。
+
+- **Windows 10/11 理论上能做**：WinRT 的 `GattServiceProvider` 能发布自定义 GATT 服务，
+  社区有实现 HID-over-GATT（0x1812）的项目；
+- **但兼容性看运气**：需要蓝牙适配器支持 peripheral 角色，Android 侧还要愿意把这个
+  GATT 服务识别并配对成 HID 鼠标，各家 ROM 差别很大，Windows 上没有现成可靠工具
+  （macOS/Linux 有成熟方案）；
+- 结论：**优先 USB**（`scrcpy --otg`，标准做法、延迟最低）。蓝牙这条路属于
+  "可以试、大概率不成"，要试我能写个最小可行性实验，半小时内给出成/不成的结论。
 
 ## 十二、亮度：两套通道，别搞混
 

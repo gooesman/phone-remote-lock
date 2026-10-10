@@ -2293,7 +2293,72 @@ def _open(path):
         log("打开 %s 失败: %s" % (path, exc))
 
 
-def _open_install_console():
+def _doctor(cfg):
+    """一键体检：手机为什么没被识别 / 怎么才能用 scrcpy --otg 拿到手机原生光标。"""
+    def line(text=""):
+        say(text)
+
+    line("=== 手机连接体检 ===")
+    code, out = _exec_raw(["devices", "-l"])
+    rows = [r for r in (out or "").splitlines()[1:] if r.strip()]
+    usb = [r for r in rows if ":" not in r.split()[0] and "._adb-tls-connect" not in r]
+    wire = [r for r in rows if r.split()[0] in (cfg.get("device") or "").split(":")[:1]
+            and ":" in r.split()[0]]
+    mdns = [r for r in rows if "._adb-tls-connect" in r]
+    line("adb 程序     : %s" % (resolve_adb(cfg) or "没找到！"))
+    line("当前配置设备 : %s" % (cfg.get("device") or "（空）"))
+    line()
+    line("--- adb devices -l ---")
+    for r in rows or ["（一台设备都没有）"]:
+        line("  " + r)
+    line()
+    line("USB 设备     : %s" % ("有！" if usb else "**没有**"))
+    line("无线设备     : %s" % (", ".join(r.split()[0] for r in (wire + mdns)) or "**没有**"))
+
+    # 驱动检查
+    plat = os.path.dirname(resolve_adb(cfg) or HERE)
+    dll = os.path.isfile(os.path.join(plat, "AdbWinApi.dll"))
+    inf = bool([f for f in os.listdir(plat) if f.lower().endswith(".inf")]) if os.path.isdir(plat) else False
+    line()
+    line("--- USB 驱动 ---")
+    line("  AdbWinApi.dll : %s" % ("有" if dll else "没有"))
+    line("  驱动 .inf     : %s" % ("有" if inf else "**没有**（官方 platform-tools 不带）"))
+    if not inf:
+        line("  → 没有 .inf 的话，**就算插上数据线，Windows 也不会把手机交给 adb**。")
+        line("    解法：用 Zadig 装 WinUSB 驱动（Options → List All Devices →")
+        line("    选 Android Composite ADB Interface / Unknown Device → Install Driver）")
+
+    line()
+    if usb:
+        line("✅ USB 已就绪，可以直接跑：")
+        line('   "%USERPROFILE%\\WorkBuddy\\xiaomi\\.workbuddy\\tools\\scrcpy\\scrcpy-win64-v5.0.1\\scrcpy.exe" --otg')
+        line("   （它会让电脑扮演 USB 鼠标，手机上就有原生光标了；注意会先 kill 掉 adb server）")
+    else:
+        line("❌ 想用 scrcpy --otg 拿原生光标，还差三步：")
+        line("   1) 用**数据线**把手机**直连电脑**（不要走扩展坞，那是让手机当主机）")
+        line("   2) 手机：开发者选项 → 打开「USB 调试」（和无线调试是两个独立开关），")
+        line("      USB 用途选「传输文件」，并允许「允许 USB 调试」")
+        line("   3) 电脑上装 ADB 驱动（Zadig + WinUSB，见上面）")
+    line()
+    line("想走蓝牙（电脑当 HID 外设）？README「蓝牙能不能走」一节有说明：理论可行但兼容性存疑。")
+    return 0
+
+
+def _exec_raw(args, timeout=12):
+    """直接调 adb（体检用，不经过 Adb 实例）。"""
+    exe = resolve_adb(load_config())
+    if not exe:
+        return -1, ""
+    try:
+        proc = subprocess.run([exe] + list(args), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=timeout,
+                              creationflags=NO_WINDOW)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace")
+    except Exception:
+        return -1, ""
+
+
+def apply_mode(cfg, mode):
     """在新控制台里跑「安装 APK」引导（托盘菜单用）。"""
     exe = sys.executable or ""
     if exe.lower().endswith("pythonw.exe"):
@@ -2639,6 +2704,9 @@ def main(argv):
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {},
     }
+
+    if action in ("doctor", "usb-check"):
+        return _doctor(cfg)
 
     if action == "overlay-size":
         name = argv[2] if len(argv) > 2 else ""

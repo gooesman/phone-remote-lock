@@ -31,17 +31,26 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lock_phone import (  # noqa: E402
-    MODES, OVERLAY_SIZES, Controller, apply_mode, default_config, load_config, log,
-    save_config, set_overlay_size, tray_running,
+    CONFIG_PATH, LOG_PATH, MODES, OVERLAY_SIZES, Controller, apply_mode,
+    default_config, load_config, log, save_config, set_overlay_size, tray_running,
 )
+
+
+def _open_path(path):
+    try:
+        if os.name == "nt":
+            os.startfile(path)   # noqa
+    except Exception as exc:
+        log("打开 %s 失败: %s" % (path, exc))
 
 try:
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QFont, QKeySequence
+    from PySide6.QtGui import QAction, QFont, QKeySequence
     from PySide6.QtWidgets import (
         QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
         QHBoxLayout, QHeaderView, QInputDialog, QKeySequenceEdit, QLabel,
-        QLineEdit, QMessageBox, QPushButton, QTableWidget, QVBoxLayout, QWidget,
+        QLineEdit, QMenu, QMessageBox, QPushButton, QTableWidget, QToolButton,
+        QVBoxLayout, QWidget,
     )
 except ImportError as exc:  # pragma: no cover
     sys.stderr.write("缺少 PySide6：.venv\\Scripts\\python.exe -m pip install PySide6\n%s\n" % exc)
@@ -94,11 +103,6 @@ SECTIONS = [
         ("桌面", "home", {}),
         ("任务切换", "app-switch", {}),
         ("通知栏", "key", {"keycode": 83}),
-    ]),
-    ("应用", [
-        ("安装 APK…", "__install_apk__", {}),
-        ("卸载 APK…", "uninstall-apk", {}),
-        ("启动 App…", "launch-app", {}),
     ]),
 ]
 
@@ -464,6 +468,14 @@ class ControlPanel(QWidget):
         self.mode_box.setCurrentIndex(idx if idx >= 0 else 0)
         self.mode_box.currentIndexChanged.connect(self._on_mode_changed)
         top.addWidget(self.mode_box)
+
+        self.more_button = QToolButton()
+        self.more_button.setText("更多功能 ▾")
+        self.more_button.setPopupMode(QToolButton.InstantPopup)
+        self.more_button.setToolTip("安装 APK、映射层尺寸、摸鱼模式、输入地址…这些不常用的都在这儿")
+        self.more_button.setMenu(self._build_more_menu())
+        top.addWidget(self.more_button)
+
         top.addStretch(1)
         root.addLayout(top)
 
@@ -518,29 +530,6 @@ class ControlPanel(QWidget):
         self.overlay_button.clicked.connect(self.host.toggle_overlay)
         row.addWidget(self.overlay_button)
 
-        covert = QPushButton("摸鱼模式")
-        covert.setObjectName("wide")
-        covert.setToolTip("无窗口：屏幕上什么都不显示，按住鼠标右键才开始控制手机")
-        covert.clicked.connect(lambda: self.host.fire("covert"))
-        row.addWidget(covert)
-
-        self.mouse_button = QPushButton("手机鼠标光标")
-        self.mouse_button.setObjectName("wide")
-        self.mouse_button.setCheckable(True)
-        self.mouse_button.setChecked(self.host.ctl.adb.is_mouse_mode())
-        self.mouse_button.setToolTip("开启后：手机把注入当鼠标用，屏幕上会出现系统鼠标光标\n"
-                                     "（映射层里移动鼠标=光标跟随，不需要蓝牙鼠标）")
-        self.mouse_button.clicked.connect(self._toggle_mouse_mode)
-        row.addWidget(self.mouse_button)
-
-        for key, label in OVERLAY_SIZES:
-            size_btn = QPushButton(label)
-            size_btn.setMaximumWidth(44)
-            size_btn.setToolTip("映射层窗口大小：%s（一键，自动保持手机比例）" % label)
-            size_btn.clicked.connect(
-                lambda _=False, k=key: self._set_overlay_size(k))
-            row.addWidget(size_btn)
-
         refresh = QPushButton("刷新状态")
         refresh.setObjectName("wide")
         refresh.clicked.connect(lambda: self.host.fire("__state__"))
@@ -551,10 +540,6 @@ class ControlPanel(QWidget):
         reconnect.clicked.connect(lambda: self.host.fire("connect"))
         row.addWidget(reconnect)
 
-        manual = QPushButton("输入地址连接")
-        manual.setObjectName("wide")
-        manual.clicked.connect(self._ask_addr)
-        row.addWidget(manual)
         root.addLayout(row)
 
         self.status_label = QLabel("就绪")
@@ -566,6 +551,60 @@ class ControlPanel(QWidget):
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+    def _build_more_menu(self):
+        """标题栏「更多功能」：不常用的东西都收进来，主面板只留高频操作。"""
+        menu = QMenu(self)
+
+        app_menu = menu.addMenu("应用 / APK")
+        act = QAction("安装 APK…", self)
+        act.setToolTip("选一个 .apk 装到手机上（也可以把 apk 拖到 install_apk.bat）")
+        act.triggered.connect(self._pick_apk)
+        app_menu.addAction(act)
+        act = QAction("卸载 APK…", self)
+        act.triggered.connect(self._ask_uninstall)
+        app_menu.addAction(act)
+        act = QAction("启动 App…", self)
+        act.triggered.connect(self._ask_launch)
+        app_menu.addAction(act)
+        app_menu.addSeparator()
+        act = QAction("安装上次的 APK", self)
+        act.setEnabled(bool(self.host.cfg.get("last_apk")))
+        act.triggered.connect(lambda: self.host.fire(
+            "install-apk", path=self.host.cfg.get("last_apk") or ""))
+        app_menu.addAction(act)
+
+        size_menu = menu.addMenu("映射层大小")
+        for key, label in OVERLAY_SIZES:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked((self.host.cfg.get("overlay_size_preset") or "") == key)
+            act.triggered.connect(lambda _=False, k=key: self._set_overlay_size(k))
+            size_menu.addAction(act)
+
+        menu.addSeparator()
+        act = QAction("摸鱼模式（无窗口）", self)
+        act.setToolTip("屏幕上什么都不显示，按住鼠标右键才开始控制手机")
+        act.triggered.connect(lambda: self.host.fire("covert"))
+        menu.addAction(act)
+
+        self.mouse_action = QAction("手机鼠标光标（鼠标源注入）", self)
+        self.mouse_action.setCheckable(True)
+        self.mouse_action.setChecked(self.host.ctl.adb.is_mouse_mode())
+        self.mouse_action.triggered.connect(self._toggle_mouse_mode)
+        menu.addAction(self.mouse_action)
+
+        menu.addSeparator()
+        act = QAction("输入地址连接手机…", self)
+        act.triggered.connect(self._ask_addr)
+        menu.addAction(act)
+        act = QAction("打开配置文件", self)
+        act.triggered.connect(lambda: _open_path(CONFIG_PATH))
+        menu.addAction(act)
+        act = QAction("打开日志", self)
+        act.triggered.connect(lambda: _open_path(LOG_PATH))
+        menu.addAction(act)
+        return menu
 
     def _refresh_mode_hint(self):
         key = self.host.cfg.get("mode") or "bili-portrait"
@@ -587,14 +626,21 @@ class ControlPanel(QWidget):
     def _set_overlay_size(self, key):
         ok, info = set_overlay_size(self.host.cfg, key)
         self.set_status(info)
+        try:
+            self.more_button.setMenu(self._build_more_menu())   # 刷新勾选状态
+        except Exception:
+            pass
 
-    def _toggle_mouse_mode(self):
-        want = self.mouse_button.isChecked()
+    def _toggle_mouse_mode(self, checked=None):
+        # Qt 对 checkable QAction 的 triggered 传的是"翻转后"的状态，容易搞反，
+        # 干脆按"当前真实状态取反"来切换，最后再用真实状态纠正菜单勾选。
+        want = not self.host.ctl.adb.is_mouse_mode()
         ok, info = self.host.ctl.run_action("set-input-source",
                                            value="mouse" if want else "touchscreen")
         self.host.cfg["input_source"] = self.host.ctl.adb.input_source()
         save_config(self.host.cfg)
-        self.mouse_button.setChecked(self.host.ctl.adb.is_mouse_mode())
+        if getattr(self, "mouse_action", None) is not None:
+            self.mouse_action.setChecked(self.host.ctl.adb.is_mouse_mode())
         self.set_status(info)
 
     def _pick_apk(self):

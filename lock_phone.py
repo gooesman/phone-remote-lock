@@ -15,7 +15,7 @@ phone-remote-lock —— 把手机变成电脑的「遥控对象」：锁屏 / �
 用法：
     python lock_phone.py                      托盘常驻 + 全局热键（左键唤起面板/映射层）
     python lock_phone.py panel                打开控制面板（按钮：亮度/音量/锁屏/刷视频）
-    python lock_phone.py overlay-toggle       切换全黑半透明鼠标映射层
+    python lock_phone.py overlay-toggle       切换鼠标映射层（手机形状矩形，可黑可白）
     python lock_phone.py overlay-on / overlay-off
     python lock_phone.py menu                 交互式遥控面板（双击 remote.bat）
     python lock_phone.py lock                 锁屏
@@ -179,9 +179,13 @@ def default_config():
         "left_click": "both",
         "panel_port": 59731,
         "panel_poll_seconds": 8,
-        "overlay_alpha": 0.55,
-        "overlay_margin": 0.06,
+        "overlay_alpha": 0.45,
+        "overlay_margin": 0.01,
         "overlay_pointer": True,
+        "overlay_color": "black",
+        "overlay_fps": 30,
+        "map_requires_right": True,
+        "arm_click_ms": 250,
         "command_timeout": 12,
         "auto_discover": True,
         "allow_kill_server": True,
@@ -991,7 +995,7 @@ class TrayApp(object):
             pystray.MenuItem("锁定手机", lambda: self._fire("lock", "锁屏")),
             pystray.MenuItem("唤醒屏幕", lambda: self._fire("wake", "唤醒")),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("映射层（全黑半透明）", pystray.Menu(
+            pystray.MenuItem("映射层（手机矩形）", pystray.Menu(
                 pystray.MenuItem("开启", lambda: self._fire("overlay-on", "映射层")),
                 pystray.MenuItem("关闭", lambda: self._fire("overlay-off", "映射层")),
                 pystray.MenuItem("切换", lambda: self._fire("overlay-toggle", "映射层")),
@@ -1228,7 +1232,7 @@ MENU_ITEMS = [
     ("h", "回到桌面", "home"),
     ("n", "通知栏", "key:83"),
     ("v", "倍速播放（长按屏幕中心）", "long-press"),
-    ("o", "切换映射层（全黑半透明）", "overlay-toggle"),
+    ("o", "切换映射层（手机矩形）", "overlay-toggle"),
     ("k", "打开控制面板", "panel"),
     ("s", "查看连接状态", "status"),
     ("c", "重新连接（用已保存的地址）", "connect"),

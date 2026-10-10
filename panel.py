@@ -713,6 +713,15 @@ class ControlPanel(QWidget):
         self.overlay_button.setChecked(bool(on))
         self.overlay_button.setText("关闭映射层" if on else "开启映射层")
 
+    def keyPressEvent(self, event):
+        # Esc = 关闭映射层；不要关控制面板（面板是常驻的，关掉窗口只是隐藏）
+        if event.key() == Qt.Key_Escape:
+            if self.host.overlay is not None and self.host.overlay.isVisible():
+                self.host.fire("overlay-off")
+                self.set_status("已关闭映射层（面板留着）")
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event):
         event.ignore()
         self.hide()
@@ -780,15 +789,23 @@ class PanelHost(object):
 
     # -- Qt 操作（只在主线程执行） --------------------------------
 
+    def _overlay_closed(self):
+        """映射层被关掉（按 Esc / 点关闭）时同步按钮状态，但**不动面板**。"""
+        self.window.set_overlay_state(False)
+        log("[panel] 映射层已关闭（面板继续留着）")
+
     def _do_overlay_on(self):
         if self.overlay is None:
             try:
-                self.overlay = overlay_mod.Overlay(self.cfg)
+                # standalone=False：它和面板在同一个进程里，关掉它绝不能退出整个进程
+                self.overlay = overlay_mod.Overlay(self.cfg, on_close=self._overlay_closed,
+                                                   standalone=False)
+                overlay_mod.apply_saved_geometry(self.overlay, self.cfg)
             except Exception as exc:
                 log("[panel] 创建映射层失败: %s" % exc)
                 return False, "创建映射层失败：%s" % exc
         try:
-            self.overlay.showFullScreen()
+            self.overlay.show()
             self.overlay.raise_()
             self.overlay.activateWindow()
             self.overlay.setFocus()

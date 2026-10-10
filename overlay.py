@@ -82,10 +82,18 @@ HINTS_IDLE = [
 
 
 class Overlay(QWidget):
-    def __init__(self, cfg):
+    def __init__(self, cfg, on_close=None, standalone=True):
+        """
+        on_close   : 关闭时的回调（面板托管时用它同步按钮状态）
+        standalone : 是不是独立进程。独立时关闭 = 退出程序；
+                     被面板托管（同一进程）时关闭**只能关自己**，
+                     否则会把面板一起带走 —— 之前按 Esc 把控制面板也关了就是这个原因。
+        """
         super().__init__()
         self.cfg = cfg
         self.ctl = Controller(cfg)
+        self.on_close = on_close
+        self.standalone = standalone
 
         self.pw = 1440
         self.ph = 3200
@@ -861,28 +869,60 @@ class Overlay(QWidget):
                 pass
 
     def _quit(self):
-        self._stop_timers()
-        self._release_hold_blocking()
-        self._pointer_restore_blocking()
-        QApplication.quit()
+        """关掉映射层本身（托管在面板进程里时，绝不能把面板也退了）。
+
+        顺序讲究：**先隐藏窗口**（按键立刻有反馈），设备侧的收尾（松手、还原触摸圆点）
+        可能要一两次 adb 往返甚至几秒，绝不卡住 UI。
+        """
+        self.timer.stop()
+        self.paint_timer.stop()
+        self.press_timer.stop()
+        self.hold_timer.stop()
+        self.arm_timer.stop()
+        self.hide()
+        if callable(self.on_close):
+            try:
+                self.on_close()
+            except Exception as exc:
+                log("[overlay] 关闭回调失败: %s" % exc)
+        if self.standalone:
+            self._shutdown(join=1.5)
+            QApplication.quit()
+        else:
+            # 托管在面板进程里：收尾丢后台，面板继续正常用
+            threading.Thread(target=self._shutdown, kwargs={"join": 4.0},
+                             daemon=True).start()
+
+    def _shutdown(self, join=2.0):
+        """释放设备状态（松手、还原触摸圆点）；join 是等 adb 收尾的最长时间。"""
+        try:
+            self._release_hold_blocking()
+        except Exception as exc:
+            log("[overlay] 松手失败: %s" % exc)
+        try:
+            self._pointer_restore_blocking(timeout=join)
+        except Exception as exc:
+            log("[overlay] 还原触摸圆点失败: %s" % exc)
 
     def closeEvent(self, event):
-        self._stop_timers()
-        self._release_hold_blocking()
-        self._pointer_restore_blocking()
+        self._shutdown(join=2.0)
         super().closeEvent(event)
 
 
-def main():
-    cfg = load_config()
-    app = QApplication(sys.argv)
-    overlay = Overlay(cfg)
+def apply_saved_geometry(overlay, cfg):
+    """按配置里的尺寸预设（或上次保存的大小）把窗口摆好。
 
-    # 窗口就是手机矩形本身：优先用上次记住的大小，否则按屏幕高度 82% 推算
-    screen = app.primaryScreen().availableGeometry()
+    main() 和"面板里开启映射层"两条路都用它，保证行为一致
+    （之前面板走的是 showFullScreen()，会和"手机形状矩形"的新设计打架）。
+    """
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance()
+    screen = app.primaryScreen().availableGeometry() if app else None
+    if screen is None:
+        return
     height = min(int(screen.height() * 0.82), 980)
     width = max(200, int(height * overlay.pw / float(overlay.ph)))
-    preset = cfg.get("overlay_size_preset") or ""
+    preset = (cfg.get("overlay_size_preset") or "").strip()
     table = {key: ratio for key, _label, ratio in SIZE_PRESETS}
     if preset in table:
         height = max(160, int(screen.height() * table[preset]))
@@ -901,6 +941,15 @@ def main():
     overlay._last_size = (width, height)
     overlay.move(screen.x() + (screen.width() - width) // 2,
                  screen.y() + (screen.height() - height) // 2)
+    overlay._relayout()
+
+
+def main():
+    cfg = load_config()
+    app = QApplication(sys.argv)
+    overlay = Overlay(cfg)
+
+    apply_saved_geometry(overlay, cfg)
 
     overlay.show()
     overlay.activateWindow()

@@ -71,5 +71,8 @@
   "covert_guide": true,
   "covert_guide_alpha": 0.3,
   "covert_guide_cross": true,
-  "covert_clip": true
+  "covert_clip": true,
+  "overlay_hide_chrome": false,
+  "overlay_win_x": 0,
+  "overlay_win_y": 0
 }

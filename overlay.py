@@ -73,11 +73,11 @@ SIZE_PRESETS = [
 
 HINTS_ARMED = [
     "映射中：左键=点按  拖动=滑动  按住不动=长按  滚轮=上/下视频  中键=桌面",
-    "1/2/3=小中大  0=满高   +/-=微调   M=鼠标光标   ←→=系统亮度   Shift+←→=App亮度",
+    "1/2/3=小中大  滚轮=自由缩放  Alt+拖动=移窗口  V=隐藏界面  0=满高  F=倍速开关",
 ]
 HINTS_IDLE = [
     "按住鼠标右键 才开始映射（避免误触）    右键快按一下 = 返回",
-    "1/2/3=小中大   0=满高（也可点右上角小方块）   M=鼠标光标   T=黑/白   U=解锁   Esc=退出",
+    "1/2/3=小中大   滚轮=自由缩放   Alt+拖动=移窗口   V=隐藏界面   M=鼠标光标   Esc=退出",
 ]
 
 
@@ -116,6 +116,9 @@ class Overlay(QWidget):
         self._dirty = True
         self._size_guard = False
         self._last_size = (self.width(), self.height())
+        self._win_drag_from = None
+        # 界面显隐：V 键一键把框/提示/小球收成几乎不可见 —— 映射层的"隐形版"
+        self.chrome_visible = not bool(cfg.get("overlay_hide_chrome", False))
         # 手机端触摸圆点：连上之前设置不了，所以连上后要自动补一次（补到成功为止）
         self._pointer_never_ok = bool(cfg.get("overlay_pointer", True))
         self._pointer_retry_at = 0.0
@@ -244,16 +247,14 @@ class Overlay(QWidget):
         self.update()
 
     def _apply_mask(self):
-        """窗口形状 = 整个窗口（这样四边还能拖动改大小）。
+        """不再设 mask。
 
-        之前把窗口裁成矩形是为了让矩形外的空白能"点穿"到桌面，
-        但那会让窗口边框一起被裁掉 → 没法用鼠标拖边缘改大小。
-        现在改成整窗，矩形外只是透明（点上去不动作，会提示"不在矩形内"）。
+        Windows 上给窗口设 setMask 之后，**标题栏拖动和边缘缩放会全部失效**
+        （窗口失去非客户区的交互），所以映射层既不能移动也不能自由缩放。
+        透明背景（WA_TranslucentBackground）已经保证矩形外看不见，
+        剩下的代价只是"点空白处也会被窗口吃掉"—— 而矩形几乎占满窗口，可以接受。
         """
-        try:
-            self.setMask(QRegion(self.rect()))
-        except Exception as exc:
-            log("[overlay] 设置窗口形状失败: %s" % exc)
+        self.clearMask()
 
     def _fit_aspect(self):
         """拖动窗口时保持手机比例：谁变得多就按谁反推另一边。"""
@@ -295,10 +296,9 @@ class Overlay(QWidget):
             h = int(w * self.ph / float(self.pw))
         self._size_guard = True
         self.resize(w, h)
+        self._center_on(w, h, screen)
         self._size_guard = False
         self._last_size = (w, h)
-        self.move(screen.x() + (screen.width() - w) // 2,
-                  screen.y() + (screen.height() - h) // 2)
         self.cfg["overlay_size_preset"] = name
         self.cfg["overlay_win_w"] = w
         self.cfg["overlay_win_h"] = h
@@ -327,7 +327,26 @@ class Overlay(QWidget):
     def _save_window_size(self):
         self.cfg["overlay_win_w"] = self.width()
         self.cfg["overlay_win_h"] = self.height()
+        self.cfg["overlay_win_x"] = self.x()
+        self.cfg["overlay_win_y"] = self.y()
         self._persist()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if not self._size_guard:
+            self._save_window_size()
+
+    def _center_on(self, w, h, screen):
+        """按新尺寸摆窗口：优先保住"原来的中心"，其次屏幕中心。"""
+        try:
+            cx = self.x() + self.width() // 2
+            cy = self.y() + self.height() // 2
+        except Exception:
+            cx, cy = 0, 0
+        if cx <= 0 or cy <= 0:
+            cx = screen.x() + screen.width() // 2
+            cy = screen.y() + screen.height() // 2
+        self.move(cx - w // 2, cy - h // 2)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -407,6 +426,15 @@ class Overlay(QWidget):
         painter.drawText(self.fx0 + 6, self.fy1 - 12,
                          self.status_text[:60])
 
+        if not self.chrome_visible:
+            # 隐形模式：只留一个极淡的矩形（边框、提示、小球全收掉）
+            painter.setPen(QPen(QColor(255, 255, 255, 26), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self.fx0 + 0.5, self.fy0 + 0.5,
+                             self.fx1 - self.fx0 - 1, self.fy1 - self.fy0 - 1)
+            painter.end()
+            return
+
         # 右上角「尺寸」小方块
         corner = QRectF(self.fx1 - 30, self.fy0 + 6, 24, 24)
         painter.setPen(QPen(self._fg(120), 1))
@@ -442,6 +470,9 @@ class Overlay(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
+        if self._win_drag_from is not None:
+            self.move(event.globalPosition().toPoint() - self._win_drag_from)
+            return
         self.mouse_pos = (pos.x(), pos.y())
         self._dirty = True
         # 鼠标模式：把光标位置同步给手机（手机屏幕上是系统鼠标光标在走）
@@ -461,6 +492,10 @@ class Overlay(QWidget):
 
     def mousePressEvent(self, event):
         pos = event.position().toPoint()
+        # Alt + 左键拖动 = 直接在窗口里挪动它（不用去够标题栏）
+        if event.button() == Qt.LeftButton and event.modifiers() & Qt.AltModifier:
+            self._win_drag_from = (event.globalPosition().toPoint() - self.pos())
+            return
         if event.button() == Qt.RightButton:
             # 按住 = 进入映射；快按一下 = 返回
             self.right_t0 = time.time()
@@ -491,6 +526,11 @@ class Overlay(QWidget):
         self._dirty = True
 
     def mouseReleaseEvent(self, event):
+        if self._win_drag_from is not None and event.button() == Qt.LeftButton:
+            self._win_drag_from = None
+            self._save_window_size()
+            self._set_status("窗口位置已记住", True)
+            return
         if event.button() == Qt.RightButton:
             self.arm_timer.stop()
             held = (time.time() - self.right_t0) * 1000 if self.right_t0 else 0
@@ -577,8 +617,13 @@ class Overlay(QWidget):
         super().keyReleaseEvent(event)
 
     def wheelEvent(self, event):
+        """滚轮两用：
+
+        · **没接管（右键没按住）→ 调窗口大小**（每格 4%，连续缩放，不用去按预设按钮）
+        · 接管中（右键按住）→ 上一个 / 下一个视频
+        """
         if not self.armed:
-            self._set_status("按住鼠标右键才能操作手机", None)
+            self.scale_window(1.04 if event.angleDelta().y() > 0 else 1 / 1.04)
             return
         now = time.time()
         if now - self.last_wheel < 0.18:
@@ -648,6 +693,13 @@ class Overlay(QWidget):
             self._enqueue("unlock")
         elif key == Qt.Key_M:
             self._enqueue("mouse-mode")
+        elif key == Qt.Key_V:
+            self.chrome_visible = not self.chrome_visible
+            self.cfg["overlay_hide_chrome"] = not self.chrome_visible
+            self._persist()
+            self._dirty = True
+            self._set_status("界面元素：%s（V 键切换，隐藏后只剩一个极淡的矩形）"
+                             % ("显示" if self.chrome_visible else "已隐藏"), True)
         elif key == Qt.Key_1:
             self.apply_preset("small")
         elif key == Qt.Key_2:
@@ -939,8 +991,17 @@ def apply_saved_geometry(overlay, cfg):
     overlay.resize(width, height)
     overlay._size_guard = False
     overlay._last_size = (width, height)
-    overlay.move(screen.x() + (screen.width() - width) // 2,
-                 screen.y() + (screen.height() - height) // 2)
+    # 位置优先用上次记住的（用户自己摆过的位置最舒服），没有才居中
+    try:
+        sx = int(cfg.get("overlay_win_x") or 0)
+        sy = int(cfg.get("overlay_win_y") or 0)
+    except Exception:
+        sx = sy = 0
+    if sx > 0 and sy > 0 and sx + width < screen.right() and sy + height < screen.bottom():
+        overlay.move(sx, sy)
+    else:
+        overlay.move(screen.x() + (screen.width() - width) // 2,
+                     screen.y() + (screen.height() - height) // 2)
     overlay._relayout()
 
 

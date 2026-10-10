@@ -53,11 +53,16 @@ NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 def _fix_console_encoding():
     """
-    让 stdout/stderr 跟随控制台真实代码页。
+    让控制台里的中文不再是乱码。
 
-    原因：Windows 中文控制台默认 cp936，若环境里设了 PYTHONUTF8=1 或
-    PYTHONIOENCODING=utf-8，Python 会按 UTF-8 写字节，控制台按 GBK 解码，
-    中文就会变成乱码。这里检测到真实控制台时，把编码对齐到它。
+    两种情况都要治：
+    1. 双击 .bat 启动：有控制台，但中文控制台默认 cp936，而环境里若设了
+       PYTHONUTF8=1 / PYTHONIOENCODING=utf-8，Python 按 UTF-8 写、控制台按 GBK 解 → 乱码。
+    2. 托盘用 CREATE_NEW_CONSOLE 拉起来（右键菜单「输入 IP:端口 连接手机」）：
+       父进程是 pythonw.exe，没有有效的标准句柄，子进程拿到的是坏句柄甚至 None，
+       于是既判断不出控制台、又按 UTF-8 往 GBK 控制台写 → 满屏方块。
+       这种直接重新打开 CONOUT$ / CONIN$ 解决。
+
     被重定向到管道/文件时不干预。
     """
     if os.name != "nt":
@@ -70,28 +75,63 @@ def _fix_console_encoding():
         kernel32.GetConsoleMode.restype = ctypes.c_int
         kernel32.GetConsoleOutputCP.restype = ctypes.c_uint
         kernel32.GetConsoleCP.restype = ctypes.c_uint
+        kernel32.GetConsoleWindow.restype = ctypes.c_void_p
     except Exception:
         return
 
-    targets = ((sys.stdout, kernel32.GetConsoleOutputCP),
-               (sys.stderr, kernel32.GetConsoleOutputCP),
-               (sys.stdin, kernel32.GetConsoleCP))
+    # 没有控制台（pythonw 常驻、或输出被重定向）就别动
+    try:
+        if not kernel32.GetConsoleWindow():
+            return
+    except Exception:
+        return
 
-    for stream, get_cp in targets:
-        if stream is None or not hasattr(stream, "reconfigure"):
-            continue
+    def is_console(stream):
+        if stream is None:
+            return False
         try:
             handle = msvcrt.get_osfhandle(stream.fileno())
             mode = ctypes.c_uint()
-            if not kernel32.GetConsoleMode(ctypes.c_void_p(handle), ctypes.byref(mode)):
-                continue  # 不是真实控制台
-            buffer_name = type(getattr(stream, "buffer", None)).__name__
-            if buffer_name == "_WindowsConsoleIO":
-                encoding = "utf-8"  # 底层是 WriteConsoleW，只接受 UTF-8
-            else:
-                cp = int(get_cp() or 0)
-                encoding = "utf-8" if cp == 65001 else ("cp%d" % cp if cp else "utf-8")
-            stream.reconfigure(encoding=encoding, errors="replace")
+            return bool(kernel32.GetConsoleMode(ctypes.c_void_p(handle), ctypes.byref(mode)))
+        except Exception:
+            return False
+
+    # 句柄不可用（GUI 父进程拉的子控制台）→ 重新打开控制台设备
+    if not is_console(sys.stdout) or not is_console(sys.stderr):
+        try:
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        except Exception:
+            pass
+        try:
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+        except Exception:
+            pass
+    if not is_console(sys.stdin):
+        try:
+            sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    # 统一把控制台代码页调成 UTF-8（改不动也没关系，下面按实际 CP 对齐）
+    try:
+        if kernel32.GetConsoleOutputCP() != 65001:
+            kernel32.SetConsoleOutputCP(65001)
+        if kernel32.GetConsoleCP() != 65001:
+            kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+
+    # 关键：字节流编码必须和控制台「当前」代码页一致，否则就是乱码
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            cp = int((kernel32.GetConsoleCP() if stream is sys.stdin
+                      else kernel32.GetConsoleOutputCP())() or 0)
+            if not cp:
+                cp = 65001
+            stream.reconfigure(encoding="utf-8" if cp == 65001 else "cp%d" % cp,
+                               errors="replace")
         except Exception:
             continue
 
@@ -910,7 +950,7 @@ class TrayApp(object):
             )),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("重新连接", lambda: self._fire("connect", "无线 adb")),
-            pystray.MenuItem("输入 IP:端口 连接手机", _open_connect_console),
+            pystray.MenuItem("连接手机（IP:端口 / 配对码）", _open_connect_console),
             pystray.MenuItem("打开配置文件", lambda: _open(CONFIG_PATH)),
             pystray.MenuItem("打开日志", lambda: _open(LOG_PATH)),
             pystray.Menu.SEPARATOR,
@@ -1072,10 +1112,12 @@ def _open_connect_console():
         cand = os.path.join(os.path.dirname(exe), "python.exe")
         if os.path.exists(cand):
             exe = cand
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"  # 兜底：保证写进新控制台的是 UTF-8
     flags = 0x00000010 if os.name == "nt" else 0  # CREATE_NEW_CONSOLE
     try:
         subprocess.Popen([exe, os.path.join(HERE, "lock_phone.py"), "connect"],
-                         cwd=HERE, creationflags=flags)
+                         cwd=HERE, creationflags=flags, env=env)
     except Exception as exc:
         log("[connect] 打开连接窗口失败: %s" % exc)
 
@@ -1145,6 +1187,48 @@ def _split_addr(text, fallback):
     return "%s:%s" % (text, f_port) if f_port else ""
 
 
+def _local_subnets():
+    """本机所有 IPv4 的 /24 前缀，用来判断保存的地址是不是已经不在当前网段。"""
+    prefixes = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                prefixes.add(ip.rsplit(".", 1)[0])
+    except Exception:
+        pass
+    return prefixes
+
+
+def _mismatch_note(addr):
+    """保存的地址看起来不在本机网段时给一句提示（换了 Wi-Fi 后常见）。"""
+    ip = (addr or "").split(":")[0]
+    if not ip or "." not in ip:
+        return ""
+    prefixes = _local_subnets()
+    if prefixes and ip.rsplit(".", 1)[0] not in prefixes:
+        return "（不在本机当前网段，多半已失效，建议以手机「无线调试」页显示的为准）"
+    return ""
+
+
+def _parse_pair_line(text, fallback):
+    """解析配对输入，支持一次粘贴「IP:端口 123456」或只给端口 / 只给 IP。
+
+    返回 (配对地址, 配对码)，缺的部分为空字符串。
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    parts = text.split()
+    addr_part, code = "", ""
+    for piece in parts:
+        if not addr_part and (":" in piece or piece.replace(".", "").isdigit()):
+            addr_part = piece
+        elif not code and piece.isdigit() and len(piece) >= 6:
+            code = piece
+    return _split_addr(addr_part, fallback), code
+
+
 def interactive_connect(ctl, cfg):
     """交互式绑定手机：手动输入 IP:端口，连不上还可以用配对码重新配对。"""
     adb = ctl.adb
@@ -1159,19 +1243,24 @@ def interactive_connect(ctl, cfg):
 
     say("   手机端：设置 → 开发者选项 → 无线调试（打开）")
     say("   页面顶部显示的 IP:端口 就是要填的地址，例如 192.168.1.23:42007")
-    say("   注意：不要填「使用配对码配对设备」弹窗里的那个端口")
+    say("   提示：刚换过 Wi-Fi、或者提示 offline / 连不上时，")
+    say("         手机「无线调试」页 →「使用配对码配对设备」走一次配对最省事。")
     say("-" * 52)
 
     saved = (cfg.get("device") or "").strip()
     guess = ""
+    pair_hint = ""
     for _name, service, addr in adb.mdns_services():
-        if service == "_adb-tls-connect._tcp":
+        if service == "_adb-tls-connect._tcp" and not guess:
             guess = addr
-            break
+        elif service == "_adb-tls-pairing._tcp" and not pair_hint:
+            pair_hint = addr
     if guess:
         say("   自动发现到设备 : %s" % guess)
+    if pair_hint:
+        say("   自动发现到配对口 : %s（手机上的配对弹窗正开着）" % pair_hint)
     if saved and saved != guess:
-        say("   上次保存的地址 : %s" % saved)
+        say("   上次保存的地址 : %s %s" % (saved, _mismatch_note(saved)))
     say("")
 
     default = guess or saved
@@ -1198,21 +1287,31 @@ def interactive_connect(ctl, cfg):
         print_status(ctl)
         return 0
 
+    # 连不上：直接把配对选项摆出来（默认就是配对，回车即进）
     say("")
-    answer = _ask("   要用「配对码」重新配对一次吗？[y/N]: ", "n") or "n"
+    say("   连接失败。要用「配对码」重新配对再连一次吗？")
+    say("   手机上打开「无线调试」→「使用配对码配对设备」，会显示 端口 + 6 位配对码。")
+    answer = _ask("   [Y] 现在配对 / [n] 退出（直接回车 = 配对）: ", "y") or "y"
     if answer.lower() not in ("y", "yes"):
-        say("已取消。修好后可以重跑本脚本，或直接：lock_phone.py connect IP:端口")
+        say("已退出。地址没变，改好后可以重跑本脚本，或：lock_phone.py connect IP:端口")
         return 1
 
-    say("   手机上点「使用配对码配对设备」，会显示 配对端口 + 6 位配对码")
-    pair_text = _ask("   配对 IP:端口: ")
-    code = _ask("   6 位配对码: ")
-    if pair_text is None or code is None or not pair_text or not code:
+    say("")
+    say("   把手机上的「配对端口」和「配对码」填进来；")
+    say("   也可以一次整行粘进来，例如：%s 123456"
+        % (pair_hint or "192.168.1.23:44667"))
+    pair_text = _ask("   配对 IP:端口 + 配对码: ")
+    if pair_text is None:
         say("FAIL 已取消")
         return 1
-    pair_addr = _split_addr(pair_text, addr)
+    pair_addr, code = _parse_pair_line(pair_text, pair_hint or addr)
     if not pair_addr:
-        say("FAIL 配对地址不完整，已取消")
+        say("FAIL 配对地址没认出来，已取消")
+        return 1
+    if not code:
+        code = _ask("   6 位配对码: ") or ""
+    if not code:
+        say("FAIL 没有配对码，已取消")
         return 1
 
     say("")
@@ -1220,14 +1319,30 @@ def interactive_connect(ctl, cfg):
     ok, info = adb.pair(pair_addr, code)
     say(("OK   " if ok else "FAIL ") + info)
     if not ok:
+        say("   配对失败通常是：配对码过期（弹窗关了要重开）、")
+        say("   或者填成了「连接端口」而不是「配对端口」。")
         return 1
 
-    ok, info = adb.connect_addr(addr)
+    # 配对成功后，用手机当前显示的连接端口再连一次
+    new_addr = addr
+    if pair_addr.split(":")[0] == addr.split(":")[0] and guess and guess != addr:
+        new_addr = guess
+    say("   正在连接 %s …" % new_addr)
+    ok, info = adb.connect_addr(new_addr)
     say(("OK   " if ok else "FAIL ") + info)
     if ok:
         say("")
         print_status(ctl)
         return 0
+
+    if new_addr != addr:
+        say("   换个端口再试：%s" % addr)
+        ok, info = adb.connect_addr(addr)
+        say(("OK   " if ok else "FAIL ") + info)
+        if ok:
+            say("")
+            print_status(ctl)
+            return 0
     return 1
 
 

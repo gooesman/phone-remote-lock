@@ -289,6 +289,8 @@ def default_config():
         "allow_kill_server": True,
         "retry_cooldown": 4.0,
         "ensure_ttl": 5,
+        "input_source": "touchscreen",
+        "overlay_move_rate": 20,
         "apk_grant_permissions": True,
         "apk_push_fallback": True,
         "apk_install_timeout": 300,
@@ -325,6 +327,20 @@ def save_config(cfg):
             json.dump(cfg, fh, ensure_ascii=False, indent=2)
     except Exception as exc:
         log("写入配置失败: %s" % exc)
+
+
+OVERLAY_SIZES = [("small", "小"), ("medium", "中"), ("large", "大"), ("max", "满高")]
+
+
+def set_overlay_size(cfg, name):
+    """设置映射层窗口尺寸预设（写进配置；映射层进程会在 2 秒内自动应用）。"""
+    table = dict(OVERLAY_SIZES)
+    name = (name or "").strip().lower()
+    if name not in table:
+        return False, "未知尺寸：%s（可选 %s）" % (name, " / ".join(table))
+    cfg["overlay_size_preset"] = name
+    save_config(cfg)
+    return True, "映射层尺寸已设为「%s」（开着的话 2 秒内自动变；没开则下次打开生效）" % table[name]
 
 
 def apply_mode(cfg, mode):
@@ -913,17 +929,19 @@ class Adb(object):
         ok, info = self.ready()
         if not ok:
             return False, info
-        code, out = self._shell(["input", "tap", str(int(x)), str(int(y))])
+        code, out = self._ins(["tap", str(int(x)), str(int(y))])
         if code != 0:
             return False, "点击失败: %s" % (out.strip() or "unknown")
+        if self.is_mouse_mode():
+            self._press_xy = None      # mouse tap 自带移动+点击
         return True, "已点击 %s,%s" % (x, y)
 
     def swipe(self, x1, y1, x2, y2, duration=160):
         ok, info = self.ready()
         if not ok:
             return False, info
-        code, out = self._shell(["input", "swipe", str(int(x1)), str(int(y1)),
-                                 str(int(x2)), str(int(y2)), str(int(duration))])
+        code, out = self._ins(["swipe", str(int(x1)), str(int(y1)),
+                               str(int(x2)), str(int(y2)), str(int(duration))])
         if code != 0:
             return False, "滑动失败: %s" % (out.strip() or "unknown")
         return True, "已滑动 %s,%s -> %s,%s" % (x1, y1, x2, y2)
@@ -978,6 +996,52 @@ class Adb(object):
             w, h = 1440, 3200
         return self.swipe(int(w * fx1), int(h * fy1), int(w * fx2), int(h * fy2), duration)
 
+    # -- 输入源（触摸 / 鼠标）-------------------------------------
+
+    def input_source(self):
+        """touchscreen（默认）或 mouse。
+
+        为什么有 mouse：安卓的 show_touches 触摸圆点**只对真实手指**显示，
+        adb 注入的触摸不会画点（HyperOS 实测如此），而且注入触摸也不是"指针"。
+        换成 `input mouse ...` 之后，系统会画**真正的鼠标光标**，
+        并且有 hover（只移动不点击）语义 —— 相当于手机连了个蓝牙鼠标，
+        但不用配对、不用硬件，直接走现有 adb 通道。
+        """
+        src = (self.cfg.get("input_source") or "touchscreen").strip().lower()
+        return src if src in ("mouse", "touchscreen", "touchpad") else "touchscreen"
+
+    def is_mouse_mode(self):
+        return self.input_source() == "mouse"
+
+    # 实测结论（小米 15 Pro / HyperOS / Android 16）：
+    #   · show_touches（触摸圆点）只对**物理手指**可视化，adb 注入的触摸不画点
+    #   · input mouse 源的点击**有效**（实测能打开 App），但 dumpsys input 里
+    #     mMouseInfoMap 仍是 <EMPTY> —— 系统不给注入事件登记鼠标指针，所以**不会画光标**
+    #   · 想让手机上真的出现光标，只能让手机"看见一个鼠标设备"（真蓝牙鼠标 / BLE HID 桥）
+
+    def _ins(self, args, source=None):
+        """给命令加上输入源前缀：mouse 模式下变成 input mouse <cmd> ..."""
+        src = source or self.input_source()
+        if src == "touchscreen":
+            return self._shell(list(args))
+        return self._shell(["input", src] + list(args))
+
+    def move_pointer(self, x, y):
+        """只移动指针不点击（鼠标模式下手机屏幕上能看到光标跟着走）。"""
+        if not self.is_mouse_mode():
+            return False, "当前不是鼠标模式"
+        return self._ins(["motionevent", "MOVE", str(int(x)), str(int(y))])
+
+    def scroll(self, x, y, amount):
+        """滚轮（鼠标模式）：正数向下滚，负数向上。"""
+        if not self.is_mouse_mode():
+            return False, "当前不是鼠标模式"
+        script = "input mouse scroll %d %d --axis SCROLL,%d" % (int(x), int(y), int(amount))
+        code, out = self._shell(script, script=True)
+        if code != 0 or "Usage:" in (out or ""):
+            return False, "这台机器的 input 不支持 scroll（%s）" % (out or "").strip()[:40]
+        return True, "已滚动 %s" % amount
+
     # -- 长按（倍速播放）-------------------------------------------
 
     def supports_motionevent(self):
@@ -996,8 +1060,7 @@ class Adb(object):
 
     def press_down(self, x, y):
         """按下不抬（配合 press_up 做长按/倍速）。"""
-        code, out = self._shell(
-            ["input", "motionevent", "DOWN", str(int(x)), str(int(y))], timeout=8)
+        code, out = self._ins(["motionevent", "DOWN", str(int(x)), str(int(y))])
         if code != 0:
             return False, (out or "").strip() or "按下失败"
         self._press_xy = (int(x), int(y))
@@ -1010,8 +1073,7 @@ class Adb(object):
             if not pos:
                 return False, "当前没有正在按下的手指"
             x, y = pos
-        code, out = self._shell(
-            ["input", "motionevent", "UP", str(int(x)), str(int(y))], timeout=8)
+        code, out = self._ins(["motionevent", "UP", str(int(x)), str(int(y))])
         self._press_xy = None
         if code != 0:
             return False, (out or "").strip() or "抬起失败"
@@ -1098,8 +1160,7 @@ class Adb(object):
         offset = 0
         while not stop_flag.wait(0.5):
             offset = 1 - offset
-            self._shell(["input", "motionevent", "MOVE",
-                         str(x + offset), str(y + offset)], timeout=6)
+            self._ins(["motionevent", "MOVE", str(x + offset), str(y + offset)])
 
     def hold_stop(self):
         """结束「按住不放」。没在按住时返回 False，避免发出多余的 UP。"""
@@ -1129,7 +1190,8 @@ class Adb(object):
         if not w or not h:
             return False, "读不到分辨率"
         x, y = int(w * fx), int(h * fy)
-        script = "input tap %d %d; sleep %.2f; input tap %d %d" % (x, y, gap, x, y)
+        prefix = "input" if not self.is_mouse_mode() else "input mouse"
+        script = "%s tap %d %d; sleep %.2f; %s tap %d %d" % (prefix, x, y, gap, prefix, x, y)
         code, out = self._shell(script, script=True)
         if code != 0:
             return False, (out or "").strip() or "双击失败"
@@ -1776,6 +1838,26 @@ class Controller(object):
             return self.adb.uninstall_package(kwargs.get("package") or kwargs.get("pkg"))
         if name in ("launch-app", "launch"):
             return self.adb.launch_package(kwargs.get("package") or kwargs.get("pkg"))
+        if name == "overlay-size":
+            return set_overlay_size(self.cfg, kwargs.get("value"))
+        if name in ("set-input-source", "mouse-mode"):
+            src = (kwargs.get("value") or kwargs.get("source") or "").strip().lower()
+            if not src:
+                src = "touchscreen" if self.adb.is_mouse_mode() else "mouse"
+            if src not in ("mouse", "touchscreen"):
+                return False, "只支持 mouse / touchscreen"
+            self.cfg["input_source"] = src
+            save_config(self.cfg)
+            if src == "mouse":
+                return True, ("已切到「鼠标源」注入：点击事件按鼠标语义派发（部分 App 的悬停/"
+                              "右键菜单能响应）。注意：安卓不会给 adb 注入的鼠标画光标，"
+                              "想看到手机上有指针需要接真鼠标/蓝牙鼠标")
+            return True, "已切回触摸源注入（最接近手指操作，App 兼容性最好）"
+        if name == "move-pointer":
+            return self.adb.move_pointer(kwargs.get("x", 0), kwargs.get("y", 0))
+        if name == "scroll":
+            return self.adb.scroll(kwargs.get("x", 0), kwargs.get("y", 0),
+                                   kwargs.get("amount", 3))
         if name in ("tap-xy",):
             return self.adb.tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
         if name == "bright-up":
@@ -1964,6 +2046,13 @@ class TrayApp(object):
                              lambda: self._fire("install-apk", "安装 APK",
                                                 path=self.cfg.get("last_apk") or "")),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("映射层大小", pystray.Menu(*[
+                pystray.MenuItem(label, lambda _i=None, m=key: self._fire("overlay-size", "尺寸",
+                                                                          value=m),
+                                 checked=lambda item, m=key: (self.cfg.get("overlay_size_preset") or "") == m,
+                                 radio=True)
+                for key, label in OVERLAY_SIZES
+            ])),
             pystray.MenuItem("映射层（手机矩形）", pystray.Menu(
                 pystray.MenuItem("开启", lambda: self._fire("overlay-on", "映射层")),
                 pystray.MenuItem("关闭", lambda: self._fire("overlay-off", "映射层")),
@@ -2057,6 +2146,7 @@ class TrayApp(object):
             "unlock": "解锁", "speed-on": "倍速开", "speed-off": "倍速关",
             "speed-toggle": "倍速开关", "long-press-once": "长按", "like": "点赞",
             "seek-forward": "快进", "seek-back": "快退", "mode": "模式",
+            "mouse-mode": "鼠标模式", "set-input-source": "输入源",
         }
         mapping = {}
         for hotkey, action in (self.cfg.get("actions") or {}).items():
@@ -2519,6 +2609,7 @@ def main(argv):
         "speed-on": {}, "speed-off": {}, "speed-toggle": {}, "long-press-once": {},
         "seek-forward": {}, "seek-back": {}, "next-video": {},
         "install-apk": {}, "uninstall-apk": {}, "launch-app": {},
+        "mouse-mode": {}, "overlay-size": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {},
     }
@@ -2527,6 +2618,15 @@ def main(argv):
         ok, info = ctl.run_action(action)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 1
+
+    if action == "overlay-size":
+        name = argv[2] if len(argv) > 2 else ""
+        if not name:
+            say("可用尺寸: %s" % " / ".join(k for k, _l in OVERLAY_SIZES))
+            return 0
+        ok, info = set_overlay_size(cfg, name)
+        say(("OK   " if ok else "FAIL ") + info)
+        return 0 if ok else 2
 
     if action in ("install-apk", "install"):
         path = argv[2] if len(argv) > 2 else ""

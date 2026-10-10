@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lock_phone import Controller, load_config, log, save_config  # noqa: E402
 
 try:
-    from PySide6.QtCore import QPointF, QRect, Qt, QTimer
+    from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
     from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QRegion
     from PySide6.QtWidgets import QApplication, QWidget
 except ImportError as exc:  # pragma: no cover
@@ -62,13 +62,22 @@ C_BALL_RING = QColor(255, 255, 255, 230)
 C_OK = QColor(141, 224, 160)
 C_BAD = QColor(255, 143, 143)
 
+# 一键尺寸预设：占屏幕可用高度的比例（按手机比例算宽度）
+SIZE_PRESETS = [
+    ("small", "小", 0.45),
+    ("medium", "中", 0.65),
+    ("large", "大", 0.85),
+    ("max", "满高", 0.95),
+]
+
+
 HINTS_ARMED = [
     "映射中：左键=点按  拖动=滑动  按住不动=长按  滚轮=上/下视频  中键=桌面",
-    "F=倍速开关  G=长按一下  ←→=系统亮度  Shift+←→=App亮度  Shift+↑↓=App音量  Esc=退出",
+    "1/2/3=小中大  0=满高   +/-=微调   M=鼠标光标   ←→=系统亮度   Shift+←→=App亮度",
 ]
 HINTS_IDLE = [
     "按住鼠标右键 才开始映射（避免误触）    右键快按一下 = 返回",
-    "F=倍速开关  G=长按一下  T=黑/白  [ ]=透明度  U=解锁  S=状态  Esc=退出",
+    "1/2/3=小中大   0=满高（也可点右上角小方块）   M=鼠标光标   T=黑/白   U=解锁   Esc=退出",
 ]
 
 
@@ -97,6 +106,15 @@ class Overlay(QWidget):
         self.status_ok = None
         self.mouse_pos = None
         self._dirty = True
+        self._size_guard = False
+        self._last_size = (self.width(), self.height())
+        # 手机端触摸圆点：连上之前设置不了，所以连上后要自动补一次（补到成功为止）
+        self._pointer_never_ok = bool(cfg.get("overlay_pointer", True))
+        self._pointer_retry_at = 0.0
+        # 鼠标模式下把光标位置同步到手机（限速，别把 adb 打满）
+        self._last_move = 0.0
+        self._cfg_check_at = 0.0
+        self._move_rate = max(5, min(60, int(cfg.get("overlay_move_rate", 20) or 20)))
 
         # 外观
         self.alpha = float(cfg.get("overlay_alpha", 0.45) or 0.45)
@@ -218,17 +236,94 @@ class Overlay(QWidget):
         self.update()
 
     def _apply_mask(self):
-        """把窗口裁成矩形本身：矩形外的区域完全透明且鼠标穿透（不挡桌面）。"""
+        """窗口形状 = 整个窗口（这样四边还能拖动改大小）。
+
+        之前把窗口裁成矩形是为了让矩形外的空白能"点穿"到桌面，
+        但那会让窗口边框一起被裁掉 → 没法用鼠标拖边缘改大小。
+        现在改成整窗，矩形外只是透明（点上去不动作，会提示"不在矩形内"）。
+        """
         try:
-            region = QRegion(QRect(self.fx0, self.fy0,
-                                   max(1, self.fx1 - self.fx0),
-                                   max(1, self.fy1 - self.fy0)))
-            self.setMask(region)
+            self.setMask(QRegion(self.rect()))
         except Exception as exc:
             log("[overlay] 设置窗口形状失败: %s" % exc)
 
+    def _fit_aspect(self):
+        """拖动窗口时保持手机比例：谁变得多就按谁反推另一边。"""
+        if self._size_guard or not self.pw or not self.ph:
+            return
+        aspect = self.pw / float(self.ph)
+        w, h = self.width(), self.height()
+        lw, lh = self._last_size
+        new_h = max(120, int(round(w / aspect)))
+        new_w = max(120, int(round(h * aspect)))
+        try:
+            self._size_guard = True
+            if abs(w - lw) >= abs(h - lh):
+                if abs(new_h - h) > 2:
+                    self.resize(w, new_h)
+            elif abs(new_w - w) > 2:
+                self.resize(new_w, h)
+        except Exception:
+            pass
+        finally:
+            self._size_guard = False
+        self._last_size = (self.width(), self.height())
+
+    def apply_preset(self, name):
+        """一键切到预设尺寸（按屏幕可用高度算，保持手机比例）。"""
+        table = {key: (label, ratio) for key, label, ratio in SIZE_PRESETS}
+        if name in ("next", "cycle"):
+            keys = [k for k, _l, _r in SIZE_PRESETS]
+            cur = self.cfg.get("overlay_size_preset") or ""
+            name = keys[(keys.index(cur) + 1) % len(keys)] if cur in keys else keys[0]
+        if name not in table:
+            return False, "未知尺寸预设：%s" % name
+        label, ratio = table[name]
+        screen = QApplication.primaryScreen().availableGeometry()
+        h = max(160, int(screen.height() * ratio))
+        w = max(120, int(h * self.pw / float(self.ph)))
+        if w > screen.width() * 0.98:
+            w = int(screen.width() * 0.98)
+            h = int(w * self.ph / float(self.pw))
+        self._size_guard = True
+        self.resize(w, h)
+        self._size_guard = False
+        self._last_size = (w, h)
+        self.move(screen.x() + (screen.width() - w) // 2,
+                  screen.y() + (screen.height() - h) // 2)
+        self.cfg["overlay_size_preset"] = name
+        self.cfg["overlay_win_w"] = w
+        self.cfg["overlay_win_h"] = h
+        self._persist()
+        self._relayout()
+        self._set_status("窗口已切到「%s」%dx%d" % (label, w, h), True)
+        return True, label
+
+    def _cycle_size(self):
+        ok, label = self.apply_preset("next")
+        if ok:
+            self._set_status("窗口尺寸：%s（再点右上角切换）" % label, True)
+
+    def scale_window(self, factor):
+        """按比例放大/缩小窗口（保持手机比例），并把大小记进配置。"""
+        w = max(160, int(round(self.width() * factor)))
+        h = max(160, int(round(w * self.ph / float(self.pw))))
+        self._size_guard = True
+        self.resize(w, h)
+        self._size_guard = False
+        self._last_size = (w, h)
+        self._save_window_size()
+        self._set_status("窗口 %dx%d（比例已锁手机）" % (w, h), True)
+        self._relayout()
+
+    def _save_window_size(self):
+        self.cfg["overlay_win_w"] = self.width()
+        self.cfg["overlay_win_h"] = self.height()
+        self._persist()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._fit_aspect()
         self._relayout()
 
     # ---------------------------------------------------------- 坐标映射
@@ -294,14 +389,26 @@ class Overlay(QWidget):
         painter.setFont(self._font(9))
         painter.setPen(self._fg(150))
         painter.drawText(self.fx0 + 6, self.fy1 - 30,
-                         "底色 %s  不透明度 %.2f" % (
-                             "黑" if self._is_dark() else "白", self.alpha))
+                         "底色 %s  不透明度 %.2f  输入 %s" % (
+                             "黑" if self._is_dark() else "白", self.alpha,
+                             "鼠标光标" if self.ctl.adb.is_mouse_mode() else "触摸"))
 
         painter.setFont(self._font(9, bold=True))
         painter.setPen(C_OK if self.status_ok else (C_BAD if self.status_ok is False
                                                    else self._fg(200)))
         painter.drawText(self.fx0 + 6, self.fy1 - 12,
                          self.status_text[:60])
+
+        # 右上角「尺寸」小方块
+        corner = QRectF(self.fx1 - 30, self.fy0 + 6, 24, 24)
+        painter.setPen(QPen(self._fg(120), 1))
+        painter.setBrush(QBrush(self._fg(30)))
+        painter.drawRoundedRect(corner, 4, 4)
+        painter.setPen(QPen(self._fg(200), 1.2))
+        painter.drawLine(QPointF(corner.left() + 6, corner.bottom() - 8),
+                         QPointF(corner.right() - 6, corner.bottom() - 8))
+        painter.drawLine(QPointF(corner.right() - 8, corner.top() + 6),
+                         QPointF(corner.right() - 8, corner.bottom() - 6))
 
         hints = HINTS_ARMED if self.armed else HINTS_IDLE
         painter.setFont(self._font(8))
@@ -329,6 +436,14 @@ class Overlay(QWidget):
         pos = event.position().toPoint()
         self.mouse_pos = (pos.x(), pos.y())
         self._dirty = True
+        # 鼠标模式：把光标位置同步给手机（手机屏幕上是系统鼠标光标在走）
+        if self.armed and self.ctl.adb.is_mouse_mode():
+            now = time.time()
+            if now - self._last_move >= 1.0 / self._move_rate:
+                self._last_move = now
+                point = self.to_phone(pos.x(), pos.y())
+                if point:
+                    self._enqueue("__move__", x=point[0], y=point[1])
         if self.drag_from and not self.drag_moved:
             dx = abs(pos.x() - self.drag_from[0])
             dy = abs(pos.y() - self.drag_from[1])
@@ -344,6 +459,13 @@ class Overlay(QWidget):
             if self.requires_arm:
                 self.arm_timer.start(self.arm_click_ms)
             self._dirty = True
+            return
+
+        # 右上角小方块 = 一键切换窗口尺寸（任何状态下都能点，不会发给手机）
+        if (event.button() == Qt.LeftButton
+                and self.fx1 - 30 <= pos.x() <= self.fx1 - 6
+                and self.fy0 + 6 <= pos.y() <= self.fy0 + 30):
+            self._cycle_size()
             return
 
         if not self.armed:
@@ -516,6 +638,20 @@ class Overlay(QWidget):
                 self._enqueue("long-press-once")
         elif key == Qt.Key_U:
             self._enqueue("unlock")
+        elif key == Qt.Key_M:
+            self._enqueue("mouse-mode")
+        elif key == Qt.Key_1:
+            self.apply_preset("small")
+        elif key == Qt.Key_2:
+            self.apply_preset("medium")
+        elif key == Qt.Key_3:
+            self.apply_preset("large")
+        elif key == Qt.Key_0:
+            self.apply_preset("max")
+        elif key in (Qt.Key_Plus, Qt.Key_Equal):
+            self.scale_window(1.08)
+        elif key == Qt.Key_Minus:
+            self.scale_window(1 / 1.08)
         elif key == Qt.Key_F11:
             if self.isFullScreen():
                 self.showNormal()
@@ -559,9 +695,12 @@ class Overlay(QWidget):
                 self._pointer_prev = prev
             # 圆点开、指针位置（十字线）关 —— 十字线会自己消失，不用
             ok, msg = self.ctl.adb.set_pointer_aids(1, 0)
-            self._pointer_on = bool(ok)
-            if ok:
+            show, _loc = self.ctl.adb.pointer_aids_state()
+            self._pointer_on = bool(ok) and show == 1
+            if self._pointer_on:
                 return "已开启手机触摸圆点（安卓自带）"
+            if ok:
+                return "设置写进去了但读回还是 %s（开发者选项总开关可能关着）" % show
             return "开启手机触摸圆点失败: %s" % (msg or "未知错误")
         except Exception as exc:
             return "开启手机触摸圆点异常: %s" % exc
@@ -614,11 +753,26 @@ class Overlay(QWidget):
                 self.result_box[0] = (ok, info)
                 continue
             if action == "__pointer__":
+                self._pointer_never_ok = False      # 手动关过就别再自动补
                 if self._pointer_on:
                     self._pointer_restore()
                     self.result_box[0] = (True, "已关闭手机触摸圆点")
                 else:
                     self.result_box[0] = (True, self._pointer_setup())
+                continue
+            if action == "__move__":
+                self.ctl.adb.move_pointer(kwargs.get("x", 0), kwargs.get("y", 0))
+                continue
+            if action == "__pointer_ensure__":
+                if self._pointer_on:
+                    self._pointer_never_ok = False
+                    continue
+                msg = self._pointer_setup()
+                if self._pointer_on:
+                    self._pointer_never_ok = False
+                    self.result_box[0] = (True, "已补开手机触摸圆点")
+                else:
+                    self.result_box[0] = (False, msg)
                 continue
             if action == "__hold_down__":
                 # 按住不放：DOWN + MOVE 心跳，等 __hold_up__ 才松手
@@ -645,6 +799,19 @@ class Overlay(QWidget):
 
     # ---------------------------------------------------------- 刷新
 
+    def _apply_cfg_size(self):
+        """看配置文件里的尺寸预设有没有被外面改过（面板/托盘），有就应用。"""
+        try:
+            data = load_config()
+        except Exception:
+            return
+        want = data.get("overlay_size_preset") or ""
+        if not want or want == self.cfg.get("overlay_size_preset"):
+            return
+        self.cfg["overlay_size_preset"] = want
+        self.apply_preset(want)
+        self._set_status("已按设置切到「%s」" % want, True)
+
     def _set_status(self, text, ok):
         self.status_text = text
         self.status_ok = ok
@@ -655,6 +822,15 @@ class Overlay(QWidget):
         if self.need_layout:
             self.need_layout = False
             self._relayout()
+        # 面板/托盘改了尺寸预设 → 2 秒内自动应用
+        if time.time() - getattr(self, "_cfg_check_at", 0) >= 2.0:
+            self._cfg_check_at = time.time()
+            self._apply_cfg_size()
+        # 启动时手机可能还没连上，导致"开圆点"这步被跳过 —— 连上后自动补
+        if (self.connected and self._pointer_never_ok
+                and time.time() >= self._pointer_retry_at):
+            self._pointer_retry_at = time.time() + 5
+            self._enqueue("__pointer_ensure__")
         item = self.result_box[0]
         if item is None:
             return
@@ -702,11 +878,27 @@ def main():
     app = QApplication(sys.argv)
     overlay = Overlay(cfg)
 
-    # 窗口就是手机矩形本身：高度取屏幕可用高度的 82%，宽度严格按手机长宽比
+    # 窗口就是手机矩形本身：优先用上次记住的大小，否则按屏幕高度 82% 推算
     screen = app.primaryScreen().availableGeometry()
     height = min(int(screen.height() * 0.82), 980)
     width = max(200, int(height * overlay.pw / float(overlay.ph)))
+    preset = cfg.get("overlay_size_preset") or ""
+    table = {key: ratio for key, _label, ratio in SIZE_PRESETS}
+    if preset in table:
+        height = max(160, int(screen.height() * table[preset]))
+        width = max(120, int(height * overlay.pw / float(overlay.ph)))
+    else:
+        try:
+            saved_w = int(cfg.get("overlay_win_w") or 0)
+            saved_h = int(cfg.get("overlay_win_h") or 0)
+            if saved_w > 120 and saved_h > 120:
+                width, height = saved_w, saved_h
+        except Exception:
+            pass
+    overlay._size_guard = True
     overlay.resize(width, height)
+    overlay._size_guard = False
+    overlay._last_size = (width, height)
     overlay.move(screen.x() + (screen.width() - width) // 2,
                  screen.y() + (screen.height() - height) // 2)
 

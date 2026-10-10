@@ -57,5 +57,10 @@
   "apk_push_fallback": true,
   "apk_install_timeout": 300,
   "last_apk": "",
-  "last_apk_dir": ""
+  "last_apk_dir": "",
+  "input_source": "touchscreen",
+  "overlay_size_preset": "large",
+  "overlay_move_rate": 20,
+  "overlay_win_w": 0,
+  "overlay_win_h": 0
 }

@@ -31,8 +31,8 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lock_phone import (  # noqa: E402
-    MODES, Controller, apply_mode, default_config, load_config, log, save_config,
-    tray_running,
+    MODES, OVERLAY_SIZES, Controller, apply_mode, default_config, load_config, log,
+    save_config, set_overlay_size, tray_running,
 )
 
 try:
@@ -518,6 +518,23 @@ class ControlPanel(QWidget):
         self.overlay_button.clicked.connect(self.host.toggle_overlay)
         row.addWidget(self.overlay_button)
 
+        self.mouse_button = QPushButton("手机鼠标光标")
+        self.mouse_button.setObjectName("wide")
+        self.mouse_button.setCheckable(True)
+        self.mouse_button.setChecked(self.host.ctl.adb.is_mouse_mode())
+        self.mouse_button.setToolTip("开启后：手机把注入当鼠标用，屏幕上会出现系统鼠标光标\n"
+                                     "（映射层里移动鼠标=光标跟随，不需要蓝牙鼠标）")
+        self.mouse_button.clicked.connect(self._toggle_mouse_mode)
+        row.addWidget(self.mouse_button)
+
+        for key, label in OVERLAY_SIZES:
+            size_btn = QPushButton(label)
+            size_btn.setMaximumWidth(44)
+            size_btn.setToolTip("映射层窗口大小：%s（一键，自动保持手机比例）" % label)
+            size_btn.clicked.connect(
+                lambda _=False, k=key: self._set_overlay_size(k))
+            row.addWidget(size_btn)
+
         refresh = QPushButton("刷新状态")
         refresh.setObjectName("wide")
         refresh.clicked.connect(lambda: self.host.fire("__state__"))
@@ -560,6 +577,19 @@ class ControlPanel(QWidget):
         # 手势相关的配置变了，让常驻进程用上新参数
         self.host.ctl = Controller(self.host.cfg)
         self.set_status("%s（快捷键/按钮已按该模式生效）" % info)
+
+    def _set_overlay_size(self, key):
+        ok, info = set_overlay_size(self.host.cfg, key)
+        self.set_status(info)
+
+    def _toggle_mouse_mode(self):
+        want = self.mouse_button.isChecked()
+        ok, info = self.host.ctl.run_action("set-input-source",
+                                           value="mouse" if want else "touchscreen")
+        self.host.cfg["input_source"] = self.host.ctl.adb.input_source()
+        save_config(self.host.cfg)
+        self.mouse_button.setChecked(self.host.ctl.adb.is_mouse_mode())
+        self.set_status(info)
 
     def _pick_apk(self):
         start_dir = self.host.cfg.get("last_apk_dir") or ""

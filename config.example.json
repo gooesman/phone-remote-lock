@@ -66,5 +66,10 @@
   "covert_move_rate": 25,
   "covert_suppress": true,
   "covert_wake_on_arm": true,
-  "covert_osd": false
+  "covert_osd": false,
+  "covert_area": "ratio",
+  "covert_guide": true,
+  "covert_guide_alpha": 0.3,
+  "covert_guide_cross": true,
+  "covert_clip": true
 }

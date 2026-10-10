@@ -294,6 +294,11 @@ def default_config():
         "covert_suppress": True,
         "covert_wake_on_arm": True,
         "covert_osd": False,
+        "covert_area": "ratio",
+        "covert_guide": True,
+        "covert_guide_alpha": 0.3,
+        "covert_guide_cross": True,
+        "covert_clip": True,
         "overlay_move_rate": 20,
         "apk_grant_permissions": True,
         "apk_push_fallback": True,
@@ -1002,6 +1007,10 @@ class Adb(object):
             if found:
                 size = (int(found.group(1)), int(found.group(2)))
                 self._size_cache = (size, time.time())
+                if list(size) != list(self.cfg.get("last_display_size") or []):
+                    # 记下来：下次新开的进程（比如摸鱼模式）可以先用它，不用等 dumpsys
+                    self.cfg["last_display_size"] = list(size)
+                    save_config(self.cfg)
                 return size
         size = self.screen_size()
         self._size_cache = ((size or (None, None)), time.time())

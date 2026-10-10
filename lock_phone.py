@@ -181,42 +181,62 @@ DEFAULT_ACTIONS = {
 MODES = {
     "bili-portrait": {
         "label": "哔哩哔哩 · 竖屏",
-        "hint": "上滑 = 下一个视频    双击 = 暂停/播放    长按 = 倍速",
+        "hint": "上滑 = 下一个视频    双击 = 暂停/播放    长按画面 = 倍速",
         "app_bright_x": 0.12,      # 左侧上下滑 = 亮度
         "app_vol_x": 0.88,         # 右侧上下滑 = 音量
+        # 倍速：B站长按画面任意处 → 按住期间加速（约 3x），松手恢复
+        "speed_point": (0.5, 0.5),
+        "speed_note": "长按画面（中心）→ 按住期间约 3x",
         "actions": {
             "next": {"type": "swipe", "path": [0.5, 0.80, 0.5, 0.25]},
             "prev": {"type": "swipe", "path": [0.5, 0.25, 0.5, 0.80]},
             "play-pause": {"type": "double-tap"},
-            "like": {"type": "double-tap"},
+            "like": {"type": "tap-node", "texts": ["点赞", "赞"],
+                     "show_controls": False,   # 竖屏右侧的赞按钮一直显示，不用先单击
+                     "msg": "B站的点赞要点右侧的赞按钮（长按还可以三连）"},
+            "long-press": {"type": "long-press", "fx": 0.5, "fy": 0.5},
+            "long-press-once": {"type": "long-press", "fx": 0.5, "fy": 0.5},
         },
     },
     "douyin": {
         "label": "抖音 · 竖屏",
-        "hint": "上滑 = 下一个视频    单击 = 暂停/播放    双击 = 点赞    长按 = 倍速",
+        "hint": "上滑 = 下一个视频    单击 = 暂停/播放    双击 = 点赞    长按画面 = 倍速",
         "app_bright_x": 0.12,
         "app_vol_x": 0.88,
+        # 倍速：抖音长按右侧 1/5 宽区域 → 按住期间 2x（不弹浮层），最适合做开关
+        "speed_point": (0.90, 0.5),
+        "speed_note": "长按右侧 1/5 区域 → 按住期间 2x（不弹浮层）",
         "actions": {
             "next": {"type": "swipe", "path": [0.5, 0.80, 0.5, 0.25]},
             "prev": {"type": "swipe", "path": [0.5, 0.25, 0.5, 0.80]},
             "play-pause": {"type": "tap"},
             "like": {"type": "double-tap"},
+            "long-press": {"type": "long-press", "fx": 0.90, "fy": 0.5},
+            "long-press-once": {"type": "long-press", "fx": 0.90, "fy": 0.5},
         },
     },
     "bili-landscape": {
         "label": "哔哩哔哩 · 横屏",
         "hint": "左右滑 = 进度    左侧上下滑 = 亮度    右侧上下滑 = 音量    双击 = 暂停；"
-                "换视频点「下一个」按钮",
+                "换视频靠「下一个」按钮",
         "app_bright_x": 0.12,
         "app_vol_x": 0.88,
+        # 倍速：横屏同样是长按画面加速，但要避开左右两侧的进度手势区，取正中偏内
+        "speed_point": (0.5, 0.5),
+        "speed_note": "长按画面正中 → 按住期间倍速（避开两侧进度手势区）",
         "actions": {
-            # 横屏没有上下滑换视频的手势 → 单击唤出控件、找「下一个」按钮点它
+            # 横屏没有上下滑换视频的手势 —— 只能单击唤出控件、找「下一个」按钮点它
             "next": {"type": "tap-node",
-                     "texts": ["下一个", "下一个视频", "下一集", "下一P"]},
-            "prev": {"type": "tap-node", "texts": ["上一个", "上一集"]},
+                     "texts": ["下一个", "下一个视频", "下一集", "下一P", "下一话"]},
+            "prev": {"type": "tap-node",
+                     "texts": ["上一个", "上一个视频", "上一集", "上一P"]},
             "play-pause": {"type": "double-tap"},
+            "like": {"type": "tap-node", "texts": ["点赞", "赞"],
+                     "msg": "B站的点赞要点右侧的赞按钮（长按还可以三连）"},
             "seek-forward": {"type": "swipe", "path": [0.35, 0.5, 0.75, 0.5]},
             "seek-back": {"type": "swipe", "path": [0.75, 0.5, 0.35, 0.5]},
+            "long-press": {"type": "long-press", "fx": 0.5, "fy": 0.5},
+            "long-press-once": {"type": "long-press", "fx": 0.5, "fy": 0.5},
         },
     },
 }
@@ -841,8 +861,8 @@ class Adb(object):
         code, out = self._shell(["cat", "/sdcard/window_dump.xml"], timeout=20)
         return out if code == 0 else ""
 
-    def find_node(self, texts, descs=()):
-        """在 UI 树里按 text / content-desc 找节点，返回 (x, y, 匹配到的词)。"""
+    def find_node(self, texts, descs=(), ids=()):
+        """在 UI 树里按 text / content-desc / resource-id 找节点，返回 (x, y, 匹配到的词)。"""
         xml = self.dump_ui()
         if not xml or "<hierarchy" not in xml:
             return None
@@ -850,6 +870,7 @@ class Adb(object):
         for node in re.findall(r"<node[^>]*>", xml):
             text = re.search(r'\btext="([^"]*)"', node)
             desc = re.search(r'content-desc="([^"]*)"', node)
+            rid = re.search(r'resource-id="([^"]*)"', node)
             bounds = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
             if not bounds:
                 continue
@@ -857,29 +878,46 @@ class Adb(object):
                                   desc.group(1) if desc else "") if g]
             for want in wanted:
                 if any(want == v or want in v for v in values):
-                    x1, y1, x2, y2 = (int(bounds.group(i)) for i in range(1, 5))
-                    if x2 > x1 and y2 > y1:
-                        return ((x1 + x2) // 2, (y1 + y2) // 2, want)
+                    return self._node_center(bounds, want)
+            if ids:
+                rid_value = (rid.group(1) if rid else "").rsplit("/", 1)[-1].lower()
+                for want in ids:
+                    if want and want.lower() in rid_value:
+                        return self._node_center(bounds, "id:" + want)
         return None
 
-    def tap_node(self, texts, descs=(), show_controls=True):
-        """点 UI 上某个按钮（例如横屏播放器里的「下一个」）。"""
+    @staticmethod
+    def _node_center(bounds, matched):
+        x1, y1, x2, y2 = (int(bounds.group(i)) for i in range(1, 5))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return ((x1 + x2) // 2, (y1 + y2) // 2, matched)
+
+    def tap_node(self, texts, descs=(), ids=(), show_controls=True, attempts=2):
+        """
+        点 UI 上某个按钮（例如 B站横屏播放器里的「下一个」）。
+
+        控件栏会自动隐藏，所以先单击画面唤出来再 dump；一次找不到就再试一次
+        （第一次单击可能只是把控件显示出来、第二次才是稳定状态）。
+        """
         ok, info = self.ready()
         if not ok:
             return False, info
-        if show_controls:
-            w, h = self.display_size()
-            if w and h:
-                self.tap(w // 2, h // 2)   # 单击唤出播放控件
-                time.sleep(0.6)
-        found = self.find_node(texts, descs)
-        if not found:
-            return False, "界面上没找到这些按钮：%s" % "/".join(texts)
-        x, y, matched = found
-        ok, info = self.tap(x, y)
-        if ok:
-            return True, "已点击「%s」(%d,%d)" % (matched, x, y)
-        return ok, info
+        ids = list(ids) or ["next", "next_video", "next_episode"]
+        for attempt in range(max(1, int(attempts))):
+            if show_controls:
+                w, h = self.display_size()
+                if w and h:
+                    self.tap(w // 2, h // 2)          # 单击唤出播放控件
+                    time.sleep(0.8 if attempt == 0 else 0.5)
+            found = self.find_node(texts, descs, ids)
+            if found:
+                x, y, matched = found
+                ok, info = self.tap(x, y)
+                if ok:
+                    return True, "已点击「%s」(%d,%d)" % (matched, x, y)
+                return ok, info
+        return False, "界面上没找到这些按钮：%s" % "/".join(list(texts))
 
     # -- 锁屏 / 解锁 -----------------------------------------------
 
@@ -1159,6 +1197,11 @@ class Controller(object):
     def _mode_spec(self, action):
         return (self.mode_info().get("actions") or {}).get(action)
 
+    def speed_point(self):
+        """当前模式下"长按倍速"该按在哪儿（抖音是右侧 1/5，B站是画面中心）。"""
+        point = self.mode_info().get("speed_point") or (0.5, 0.5)
+        return float(point[0]), float(point[1])
+
     def _run_gesture(self, spec):
         """按模式表里的一条手势规格执行。"""
         kind = (spec or {}).get("type")
@@ -1175,7 +1218,12 @@ class Controller(object):
             return adb.long_press_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5),
                                         spec.get("ms", self.cfg.get("long_press_hold_ms", 1200)))
         if kind == "tap-node":
-            return adb.tap_node(spec.get("texts") or [], spec.get("descs") or [])
+            ok, info = adb.tap_node(spec.get("texts") or [], spec.get("descs") or [],
+                                    ids=spec.get("ids") or [],
+                                    show_controls=spec.get("show_controls", True))
+            if not ok and spec.get("msg"):
+                info += "；" + spec["msg"]
+            return ok, info
         return False, "模式表里有不认识的手势类型: %s" % kind
 
     def run_action(self, name, **kwargs):
@@ -1215,12 +1263,20 @@ class Controller(object):
             ms = kwargs.get("ms") or self.cfg.get("long_press_hold_ms", 1200)
             return self.adb.long_press_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5), ms)
         if name in ("speed-on", "speed-toggle", "speed-off"):
-            # 倍速开关：按住不放（带 MOVE 心跳），再按一次才松开
+            # 倍速开关：按住不放（带 MOVE 心跳），再按一次才松开。
+            # 按哪儿由模式决定：抖音在右侧 1/5（按住 2x 不弹浮层），B站在画面中心。
+            fx, fy = self.speed_point()
             if name == "speed-off" or self.adb.is_holding():
                 ok, info = self.adb.hold_stop()
                 return (True, "倍速已关（已松开）") if ok else (ok, info)
-            ok, info = self.adb.hold_start(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
-            return (True, "倍速已开（按住中）· 再按一次关闭") if ok else (ok, info)
+            if "fx" in kwargs or "fy" in kwargs:
+                fx = kwargs.get("fx", fx)
+                fy = kwargs.get("fy", fy)
+            ok, info = self.adb.hold_start(fx, fy)
+            if ok:
+                return True, ("倍速已开（按住中）· 再按一次关闭｜%s"
+                              % self.mode_info().get("speed_note", ""))
+            return ok, info
         if name in ("like", "double-tap"):
             return self.adb.double_tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
         if name in ("seek-forward", "seek-back"):

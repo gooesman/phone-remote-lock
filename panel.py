@@ -534,8 +534,8 @@ class ControlPanel(QWidget):
     def _refresh_mode_hint(self):
         key = self.host.cfg.get("mode") or "bili-portrait"
         info = MODES.get(key) or {}
-        self.mode_hint.setText("当前模式：%s\n%s" % (info.get("label", key),
-                                                   info.get("hint", "")))
+        self.mode_hint.setText("当前模式：%s\n%s\n倍速：%s" % (
+            info.get("label", key), info.get("hint", ""), info.get("speed_note", "")))
 
     def _on_mode_changed(self, _index):
         key = self.mode_box.currentData()

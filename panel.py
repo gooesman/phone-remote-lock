@@ -518,6 +518,12 @@ class ControlPanel(QWidget):
         self.overlay_button.clicked.connect(self.host.toggle_overlay)
         row.addWidget(self.overlay_button)
 
+        covert = QPushButton("摸鱼模式")
+        covert.setObjectName("wide")
+        covert.setToolTip("无窗口：屏幕上什么都不显示，按住鼠标右键才开始控制手机")
+        covert.clicked.connect(lambda: self.host.fire("covert"))
+        row.addWidget(covert)
+
         self.mouse_button = QPushButton("手机鼠标光标")
         self.mouse_button.setObjectName("wide")
         self.mouse_button.setCheckable(True)

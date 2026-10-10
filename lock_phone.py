@@ -646,7 +646,9 @@ class Adb(object):
             return True
         if head == "input":
             sub = command[1] if len(command) > 1 else ""
-            return sub in ("keyevent", "tap", "motionevent", "text")
+            # swipe 会在设备侧阻塞 duration 毫秒，但我们本来就是串行队列，
+            # 走通道省掉 36ms 进程启动，值。
+            return sub in ("keyevent", "tap", "motionevent", "text", "swipe")
         return False
 
     def _get_channel(self, force=False):
@@ -804,12 +806,29 @@ class Adb(object):
         code, out = result
         return code == 0 and "ok" in (out or "")
 
+    def _prefer_usb(self, states):
+        """看到 USB 连接就切过去：USB 的往返比无线稳、也快（插上数据线自动生效）。"""
+        usb = [s for s, st in states.items()
+               if st == "device" and ":" not in s and "_adb-tls-connect" not in s]
+        if not usb:
+            return
+        if self.target in usb:
+            return
+        log("[adb] 检测到 USB 连接 %s，从 %s 切过去（延迟更低）" % (usb[0], self.target or "无"))
+        self.target = usb[0]
+        self.close_channel("切到 USB")
+        self.invalidate_size()
+        self.cfg["device"] = usb[0]
+        save_config(self.cfg)
+
     def _ensure_impl(self):
         if not self.adb:
             return False, "未找到 adb，请先安装 Android Platform Tools"
 
         saw_offline = False
         tried_kill = False
+
+        self._prefer_usb(self._devices())
 
         for attempt in range(3):
             states = self._devices()
@@ -1023,7 +1042,7 @@ class Adb(object):
         """给命令加上输入源前缀：mouse 模式下变成 input mouse <cmd> ..."""
         src = source or self.input_source()
         if src == "touchscreen":
-            return self._shell(list(args))
+            return self._shell(["input"] + list(args))
         return self._shell(["input", src] + list(args))
 
     def move_pointer(self, x, y):

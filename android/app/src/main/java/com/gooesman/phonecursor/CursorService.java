@@ -154,7 +154,7 @@ public class CursorService extends AccessibilityService {
                     put16(out, 6, (int) x);
                     put16(out, 8, (int) y);
                     put16(out, 10, pressed ? 1 : 0);
-                    put16(out, 12, cursorView != null ? 1 : 0);
+                    put16(out, 12, (cursorView != null && cursorView.isVisible()) ? 1 : 0);
                     socket.send(new DatagramPacket(out, out.length, from, port));
                     break;
                 }
@@ -180,7 +180,9 @@ public class CursorService extends AccessibilityService {
     }
 
     private void updateCursor() {
-        if (cursorView != null) cursorView.update((int) x, (int) y, pressed);
+        if (cursorView == null) return;
+        cursorView.ensureAttached();      // 服务重启后若没挂上，这里补挂
+        cursorView.update((int) x, (int) y, pressed);
     }
 
     // ---------------- 手势 ----------------

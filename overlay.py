@@ -120,12 +120,22 @@ class Overlay(QWidget):
         # 界面显隐：V 键一键把框/提示/小球收成几乎不可见 —— 映射层的"隐形版"
         self.chrome_visible = not bool(cfg.get("overlay_hide_chrome", False))
         # 手机端触摸圆点：连上之前设置不了，所以连上后要自动补一次（补到成功为止）
-        self._pointer_never_ok = bool(cfg.get("overlay_pointer", True))
+        # 实测（小米 15 Pro / HyperOS）：show_touches 只对**物理手指**显示，
+        # adb 注入的触摸不画点。所以默认不再反复去设置它（纯属白花 adb、还堵住队列），
+        # 需要的话把 config 里 overlay_pointer 改成 true，或按 P 手动切。
+        self._pointer_never_ok = bool(cfg.get("overlay_pointer", False))
         self._pointer_retry_at = 0.0
         # 鼠标模式下把光标位置同步到手机（限速，别把 adb 打满）
         self._last_move = 0.0
         self._cfg_check_at = 0.0
-        self._move_rate = max(5, min(60, int(cfg.get("overlay_move_rate", 20) or 20)))
+        # 网络后端每条只是一个 UDP 包（~0.1ms），可以跑很高频；adb 后端每条约 30-40ms，
+        # 高频只会把通道堵死 —— 所以按后端给不同上限与默认值。
+        _backend = (cfg.get("pointer_backend") or "adb").strip().lower()
+        _cap = 120 if _backend == "net" else 60
+        _def = 100 if _backend == "net" else 20
+        self._move_rate = max(5, min(_cap, int(cfg.get("overlay_move_rate", _def) or _def)))
+        self._pending_move = None      # 合并：只保留最新坐标，避免排队造成延迟
+        self._move_queued = False
 
         # 外观
         self.alpha = float(cfg.get("overlay_alpha", 0.45) or 0.45)
@@ -168,6 +178,11 @@ class Overlay(QWidget):
         self._relayout()
 
         threading.Thread(target=self._worker, daemon=True).start()
+        # 快车道：鼠标位置同步专用。
+        # 主 worker 会做 dumpsys 这类慢调用（亮度实测 700ms+），移动事件排在后面
+        # 就会表现为"光标不动/延迟很大"。这里给它独立线程，插队直接发。
+        self.pqueue = queue.Queue()
+        threading.Thread(target=self._pworker, daemon=True).start()
 
         # 状态轮询降频：以前 80ms 一次，鼠标高频移动时容易把重绘挤掉
         self.timer = QTimer(self)
@@ -475,14 +490,21 @@ class Overlay(QWidget):
             return
         self.mouse_pos = (pos.x(), pos.y())
         self._dirty = True
-        # 鼠标模式：把光标位置同步给手机（手机屏幕上是系统鼠标光标在走）
-        if self.armed and self.ctl.adb.is_mouse_mode():
+        # 同步光标位置到手机。两种情况需要：
+        #   · pointer 后端是 net（手机上的「手机光标」App，会画出可见光标）
+        #   · adb + mouse 源（虽然系统不画光标，但事件里带坐标，个别 App 会响应）
+        # 之前只在第二种情况下同步 → 用 net 后端时**位置从来没发出去过**（准星不动）。
+        if self.armed and (self.ctl.pointer is not self.ctl.adb
+                           or self.ctl.adb.is_mouse_mode()):
             now = time.time()
             if now - self._last_move >= 1.0 / self._move_rate:
                 self._last_move = now
                 point = self.to_phone(pos.x(), pos.y())
                 if point:
-                    self._enqueue("__move__", x=point[0], y=point[1])
+                    self._pending_move = point      # 合并：快车道取走即发
+                    if not self._move_queued:
+                        self._move_queued = True
+                        self.pqueue.put(("__move__", {}))
         if self.drag_from and not self.drag_moved:
             dx = abs(pos.x() - self.drag_from[0])
             dy = abs(pos.y() - self.drag_from[1])
@@ -794,6 +816,23 @@ class Overlay(QWidget):
             return
         self.queue.put((action, kwargs))
 
+    def _pworker(self):
+        """只处理鼠标位置同步，永远不等慢任务。"""
+        while True:
+            try:
+                action, kwargs = self.pqueue.get()
+            except Exception:
+                return
+            if action == "__move__":
+                pos = self._pending_move
+                self._pending_move = None
+                self._move_queued = False
+                if pos:
+                    try:
+                        self.ctl.pointer.move_pointer(pos[0], pos[1])
+                    except Exception as exc:
+                        log("[overlay] 光标同步失败: %s" % exc)
+
     def _worker(self):
         while True:
             action, kwargs = self.queue.get()
@@ -819,9 +858,6 @@ class Overlay(QWidget):
                     self.result_box[0] = (True, "已关闭手机触摸圆点")
                 else:
                     self.result_box[0] = (True, self._pointer_setup())
-                continue
-            if action == "__move__":
-                self.ctl.pointer.move_pointer(kwargs.get("x", 0), kwargs.get("y", 0))
                 continue
             if action == "__pointer_ensure__":
                 if self._pointer_on:

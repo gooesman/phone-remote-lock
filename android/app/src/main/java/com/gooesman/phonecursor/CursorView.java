@@ -43,8 +43,11 @@ public class CursorView {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.START;
+        current = new Overlay();
         try {
-            wm.addView(new Overlay(), params);
+            wm.addView(current, params);
+            attached = true;
+            android.util.Log.i("PhoneCursor", "悬浮窗已添加");
         } catch (Exception exc) {
             android.util.Log.e("PhoneCursor",
                     "悬浮窗添加失败（是否已允许「显示在其他应用上层」？）", exc);
@@ -54,7 +57,7 @@ public class CursorView {
     public void setSize(int w, int h) {
         params.width = w;
         params.height = h;
-        refresh();
+        applyLayout();
     }
 
     public void update(int nx, int ny, boolean isPressed) {
@@ -69,21 +72,52 @@ public class CursorView {
         refresh();
     }
 
+    /** 绘制内容变了 → 只要重绘。 */
     private void refresh() {
-        try {
-            wm.updateViewLayout(current, params);
-        } catch (Exception exc) {
-            android.util.Log.w("PhoneCursor", "updateViewLayout 失败", exc);
-        }
-        // 关键：参数没变化时 updateViewLayout 不一定触发重绘，
-        // 必须显式 invalidate，否则光标移动了但屏幕上不刷新。
+        // 注意：**不要**在这里调 updateViewLayout。
+        // 光标位置是画在 canvas 上的，不是布局参数变了；
+        // 而带 FLAG_LAYOUT_NO_LIMITS 的窗口在 Android 12+ 调 updateViewLayout
+        // 会直接抛异常（logcat 里每次移动都在报），反而把重绘也带崩了。
         try {
             current.invalidate();
         } catch (Exception ignore) {
         }
     }
 
+    /** 第一次真正需要改布局参数时才更新（并且要有 try/catch 兜底）。 */
+    private void applyLayout() {
+        try {
+            wm.updateViewLayout(current, params);
+        } catch (Exception exc) {
+            android.util.Log.w("PhoneCursor", "updateViewLayout 失败（忽略）", exc);
+        }
+    }
+
+    private boolean attached = false;
+
+    public boolean isVisible() {
+        return visible;
+    }
+
+    /** 悬浮窗没加上（比如权限是服务启动之后才给的）就补一次。 */
+    public void ensureAttached() {
+        if (attached) {
+            refresh();
+            return;
+        }
+        try {
+            wm.addView(current, params);
+            attached = true;
+            android.util.Log.i("PhoneCursor", "悬浮窗补挂成功");
+        } catch (Exception exc) {
+            android.util.Log.w("PhoneCursor", "悬浮窗仍挂不上："
+                    + "请确认已允许「显示在其他应用上层」", exc);
+        }
+        refresh();
+    }
+
     public void destroy() {
+        attached = false;
         try {
             wm.removeView(current);
         } catch (Exception ignore) {
@@ -91,16 +125,20 @@ public class CursorView {
     }
 
     private Overlay current;
+    private boolean drawnOnce = false;
 
     private class Overlay extends android.view.View {
         Overlay() {
             super(ctx);
-            current = this;
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
-            if (!visible || x < 0) return;
+            if (!visible) return;
+            if (!drawnOnce) {
+                drawnOnce = true;
+                android.util.Log.i("PhoneCursor", "光标首帧已绘制 @" + (int) x + "," + (int) y);
+            }
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(pressed ? 5f : 3.5f);
             paint.setColor(pressed ? Color.argb(235, 255, 140, 40) : Color.argb(200, 255, 255, 255));

@@ -274,7 +274,7 @@ def default_config():
         "panel_poll_seconds": 8,
         "overlay_alpha": 0.45,
         "overlay_margin": 0.01,
-        "overlay_pointer": True,
+        "overlay_pointer": False,
         "overlay_color": "black",
         "overlay_fps": 30,
         "overlay_hide_chrome": False,

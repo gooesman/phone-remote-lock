@@ -181,20 +181,14 @@ public class CursorService extends AccessibilityService {
     private void doTap(final int tx, final int ty, final int holdMs) {
         final Path path = new Path();
         path.moveTo(tx, ty);
-        final long t0 = android.os.SystemClock.uptimeMillis();
+        // 注：API 35 的公开桩里 GestureDescription.OnCompletedCallback 已不可用，
+        // 光标按下态的复位统一交给下面的 Handler 定时器。
         final long hold = Math.max(40, holdMs);
-        GestureDescription.Builder b = new GestureDescription.Builder()
-                .addStroke(new GestureDescription.StrokeDescription(path, 0, hold));
-        b.addCompletedCallback(new GestureDescription.OnCompletedCallback() {
-            @Override
-            public void onCompleted(GestureDescription d) {
-                pressed = false;
-                updateCursor();
-            }
-        });
-        GestureDescription desc = b.build();
+        GestureDescription desc = new GestureDescription.Builder()
+                .addStroke(new GestureDescription.StrokeDescription(path, 0, hold))
+                .build();
         pending++;
-        dispatchGesture(desc, new Callback() {
+        dispatchGesture(desc, new AccessibilityService.GestureResultCallback() {
             @Override
             public void onCompleted(GestureDescription d) {
                 pending = Math.max(0, pending - 1);
@@ -234,7 +228,7 @@ public class CursorService extends AccessibilityService {
         updateCursor();
         dispatchGesture(new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(path, 0, dur))
-                .build(), new Callback() {
+                .build(), new AccessibilityService.GestureResultCallback() {
             @Override
             public void onCompleted(GestureDescription d) {
                 pressed = false;

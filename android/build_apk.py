@@ -64,9 +64,17 @@ def find_tools():
     print("JDK         :", JDK)
 
 
+def build_env():
+    """d8 / apksigner / zipalign 都是 .bat，需要 JAVA_HOME 和 PATH 里有 java。"""
+    env = dict(os.environ)
+    env["JAVA_HOME"] = JDK
+    env["PATH"] = os.path.join(JDK, "bin") + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def run(args, label, cwd=None):
     t0 = time.time()
-    proc = subprocess.run(args, capture_output=True, cwd=cwd)
+    proc = subprocess.run(args, capture_output=True, cwd=cwd, env=build_env())
     out = (proc.stdout or b"").decode("utf-8", "replace")
     err = (proc.stderr or b"").decode("utf-8", "replace")
     if proc.returncode != 0:
@@ -121,8 +129,10 @@ def main():
                 (os.path.relpath(os.path.join(r, f), GEN)
                  for r, _d, fs in os.walk(GEN) for f in fs if f.endswith(".java"))]
     print("java 源文件 %d 个" % len(sources))
-    run([os.path.join(JDK, "bin", "javac.exe"), "-source", "17", "-target", "17",
-         "-encoding", "UTF-8", "-nowarn", "-bootclasspath", android_jar,
+    # JDK 9+ 不允许 -source 17 配 -bootclasspath，所以用 8（Android 字节码，d8 能处理）
+    run([os.path.join(JDK, "bin", "javac.exe"), "-source", "8", "-target", "8",
+         "-encoding", "UTF-8", "-nowarn", "-Xlint:-options",
+         "-bootclasspath", android_jar,
          "-classpath", android_jar, "-d", CLASSES] + sources, "javac")
 
     # 4) dex

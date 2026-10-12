@@ -1457,7 +1457,7 @@ class Adb(object):
         package = (package or "").strip().split(":")[-1]
         if not package or "." not in package:
             return False, "包名看起来不对：%s（形如 com.example.app）" % package
-        args = ["uninstall"] + (["-k"] if keep_data else []) + [package]
+        args = ["-s", self.target, "uninstall"] + (["-k"] if keep_data else []) + [package]
         code, out = self._exec(args, timeout=120)
         text = (out or "").strip()
         if "Success" in text:
@@ -1747,7 +1747,7 @@ class Adb(object):
     # -- 配对 ------------------------------------------------------
 
     def pair(self, addr, code_str):
-        code, out = self._exec(["pair", addr, code_str], timeout=40)
+        code, out = self._exec(["-s", self.target, "pair", addr, code_str], timeout=40)
         text = (out or "").strip()
         ok = code == 0 and ("Successfully paired" in text or "already paired" in text.lower())
         if ok:
@@ -2823,7 +2823,8 @@ def main(argv):
         "speed-on": {}, "speed-off": {}, "speed-toggle": {}, "long-press-once": {},
         "seek-forward": {}, "seek-back": {}, "next-video": {},
         "launch-app": {},
-        "mouse-mode": {}, "overlay-size": {},
+        "mouse-mode": {}, "overlay-size": {}, "doctor": {}, "dot-test": {},
+        "pointer-backend": {}, "pointer-status": {}, "cursor-visibility": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {}, "doctor": {}, "dot-test": {},
     }
@@ -2883,7 +2884,10 @@ def main(argv):
         return 0 if ok else 1
 
     if action in simple:
-        ok, info = ctl.run_action(action)
+        extra = {}          # 命令行第 3 个参数按位置传进动作（例如 pointer-backend net）
+        if len(argv) > 2 and argv[2] and not argv[2].startswith("-"):
+            extra["value"] = argv[2]
+        ok, info = ctl.run_action(action, **extra)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 1
 
@@ -3004,6 +3008,8 @@ def main(argv):
         say("可用: lock / wake / vol-up / vol-down / mute / play-pause / next / prev /")
         say("      bright-up / bright-down / bright <值> / swipe / tap / key /")
         say("      status / connect [IP:PORT] / discover / pair / mode [key] /")
+        say("      pointer-backend [adb|net] / pointer-status / cursor-visibility /")
+        say("      doctor / dot-test /")
         say("      speed-toggle / long-press-once / unlock / like / app-bright-up /")
         say("      app-vol-up / seek-forward / next-video")
         return 2

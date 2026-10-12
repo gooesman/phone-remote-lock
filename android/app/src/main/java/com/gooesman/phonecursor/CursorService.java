@@ -31,7 +31,7 @@ public class CursorService extends AccessibilityService {
 
     private CursorView cursorView;
     private int screenW = 1080, screenH = 2400;
-    private float x = -1, y = -1;
+    private float x = 0, y = 0;
     private boolean pressed = false;
     private int pending = 0;                 // 连续手势排队计数
 
@@ -40,8 +40,9 @@ public class CursorService extends AccessibilityService {
         super.onServiceConnected();
         Log.i(TAG, "无障碍服务已连接");
         try {
-            screenW = getResources().getConfiguration().screenWidthDp;
-            screenH = getResources().getConfiguration().screenHeightDp;
+            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+            screenW = dm.widthPixels;
+            screenH = dm.heightPixels;
         } catch (Throwable ignore) {
         }
         cursorView = new CursorView(this);

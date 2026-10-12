@@ -36,7 +36,8 @@ SRC = os.path.join(APP, "src", "main")
 OUT = os.path.join(APP, "build")
 GEN = os.path.join(OUT, "gen")
 CLASSES = os.path.join(OUT, "classes")
-KEYSTORE = os.path.join(OUT, "debug.keystore")
+# 密钥放在 build 目录**外面**：build 每次都会清空，密钥变了就没法覆盖安装同包名的 App
+KEYSTORE = os.path.join(HERE, "debug.keystore")
 APK = os.path.join(OUT, "phone-cursor.apk")
 
 

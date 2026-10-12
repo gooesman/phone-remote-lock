@@ -47,7 +47,7 @@ try:
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QAction, QFont, QKeySequence
     from PySide6.QtWidgets import (
-        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
         QHBoxLayout, QHeaderView, QInputDialog, QKeySequenceEdit, QLabel,
         QLineEdit, QMenu, QMessageBox, QPushButton, QTableWidget, QToolButton,
         QVBoxLayout, QWidget,
@@ -112,6 +112,11 @@ QLabel#title { font-size: 15px; font-weight: 500; color: #f0f0f0; }
 QLabel#dim { color: #8b8f96; font-size: 11px; }
 QLabel#status { color: #c3c8d0; font-size: 11px; }
 QLabel#sect { color: #7f858e; font-size: 11px; }
+QFrame#hintbox { background: rgba(74, 140, 224, 30); border: 1px solid rgba(74, 140, 224, 110);
+                 border-radius: 8px; }
+QPushButton#primary { background: #4a8ce0; color: #ffffff; font-weight: bold;
+                      border: 1px solid #6ba6ea; border-radius: 6px; padding: 6px 20px; }
+QPushButton#primary:hover { background: #5b9ceb; }
 QPushButton { background: #23262c; border: 1px solid #34383f; border-radius: 6px;
               padding: 6px 4px; min-height: 24px; }
 QPushButton:hover { background: #2d3138; }
@@ -485,7 +490,7 @@ class ControlPanel(QWidget):
         root.addWidget(self.mode_hint)
         self._refresh_mode_hint()
 
-        title = QLabel("手机遥控")
+        title = QLabel("手机遥控 · 控制面板")
         title.setObjectName("title")
         root.addWidget(title)
 
@@ -496,6 +501,41 @@ class ControlPanel(QWidget):
         self.bright_label = QLabel("亮度：读取中…")
         self.bright_label.setObjectName("dim")
         root.addWidget(self.bright_label)
+
+        # 顶部横幅：把"从哪开、怎么用"直接写在脸上
+        banner = QFrame()
+        banner.setObjectName("hintbox")
+        hb = QVBoxLayout(banner)
+        hb.setContentsMargins(10, 8, 10, 8)
+        hb.setSpacing(6)
+        hb.addWidget(QLabel("① 点「开始使用」开映射层　→　② 在映射层窗口里按住鼠标右键 = 操作手机"))
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.start_button = QPushButton("开始使用")
+        self.start_button.setObjectName("primary")
+        self.start_button.setMinimumHeight(34)
+        self.start_button.setToolTip("一键完成：连手机 → 检查光标链路 → 打开映射层")
+        self.start_button.clicked.connect(self._start_everything)
+        btn_row.addWidget(self.start_button)
+
+        self.backend_button = QPushButton("手机光标")
+        self.backend_button.setCheckable(True)
+        self.backend_button.setToolTip(
+            "开启：鼠标事件发给手机上的「手机光标」App（手机上有可见光标）\n"
+            "关闭：用 adb 注入（手机上没有光标，但兼容性最好）")
+        self.backend_button.setChecked(
+            (self.host.cfg.get("pointer_backend") or "adb").lower() == "net")
+        self.backend_button.clicked.connect(self._toggle_backend)
+        btn_row.addWidget(self.backend_button)
+
+        self.help_label = QLabel("")
+        self.help_label.setObjectName("dim")
+        self.help_label.setWordWrap(True)
+        btn_row.addWidget(self.help_label, 1)
+        hb.addLayout(btn_row)
+        root.addWidget(banner)
+        self._refresh_help()
 
         for name, items in SECTIONS:
             caption = QLabel(name)
@@ -617,6 +657,42 @@ class ControlPanel(QWidget):
         # 手势相关的配置变了，让常驻进程用上新参数
         self.host.ctl = Controller(self.host.cfg)
         self.set_status("%s（快捷键/按钮已按该模式生效）" % info)
+
+    def _refresh_help(self):
+        backend = (self.host.cfg.get("pointer_backend") or "adb").lower()
+        phone_ip = self.host.cfg.get("net_host") or "未设置"
+        if backend == "net":
+            self.help_label.setText("当前：手机光标模式（手机 IP %s）" % phone_ip)
+        else:
+            self.help_label.setText("当前：adb 注入（手机上没有光标）")
+
+    def _toggle_backend(self, checked=None):
+        want = "net" if self.backend_button.isChecked() else "adb"
+        if want == "net" and not (self.host.cfg.get("net_host") or "").strip():
+            self.set_status("还没填手机 IP：跑 python lock_phone.py doctor 能看到地址，"
+                            "填到 config.json 的 net_host 再切")
+            self.backend_button.setChecked(False)
+            return
+        ok, info = self.host.ctl.run_action("pointer-backend", value=want)
+        self.set_status(info)
+        self.backend_button.setChecked(
+            (self.host.cfg.get("pointer_backend") or "adb").lower() == "net")
+        self._refresh_help()
+
+    def _start_everything(self):
+        """一键开始：连手机 → 试光标链路 → 打开映射层。"""
+        ok, info = self.host.ctl.adb.ensure()
+        self.set_status(("已连手机：" if ok else "连手机失败：") + info)
+        ptr = self.host.ctl.pointer
+        if ptr is not self.host.ctl.adb:
+            alive, msg = ptr.status()
+            self.set_status("手机光标链路：" + ("正常（%s）" % msg if alive else msg))
+        if self.host.overlay is not None and self.host.overlay.isVisible():
+            self.set_status("映射层已经开着 —— 在窗口里按住鼠标右键即可操作手机")
+            return
+        self.host.toggle_overlay()
+        self.set_status("映射层已打开：在窗口里按住鼠标右键开始操作手机"
+                        "（移动=光标跟随，左键=点击/拖动，滚轮=上下视频，Esc=关闭）")
 
     def _set_overlay_size(self, key):
         ok, info = set_overlay_size(self.host.cfg, key)

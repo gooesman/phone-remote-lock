@@ -54,7 +54,13 @@ public class CursorService extends AccessibilityService {
 
     private void startReceiver() {
         try {
-            socket = new DatagramSocket(PORT);
+            if (socket != null) {          // 服务可能被系统反复重连，先释放旧 socket
+                try { socket.close(); } catch (Exception ignore) { }
+                socket = null;
+            }
+            socket = new DatagramSocket(null);
+            socket.setReuseAddress(true);
+            socket.bind(new java.net.InetSocketAddress(PORT));
             socket.setSoTimeout(1000);
         } catch (Exception exc) {
             Log.e(TAG, "UDP 端口被占用或不可用: " + exc);
@@ -252,6 +258,17 @@ public class CursorService extends AccessibilityService {
 
     @Override
     public void onInterrupt() {
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        try {
+            if (socket != null) socket.close();
+        } catch (Exception ignore) {
+        }
+        if (cursorView != null) cursorView.destroy();
+        super.onDestroy();
     }
 
     @Override

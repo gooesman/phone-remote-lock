@@ -821,7 +821,7 @@ class Overlay(QWidget):
                     self.result_box[0] = (True, self._pointer_setup())
                 continue
             if action == "__move__":
-                self.ctl.adb.move_pointer(kwargs.get("x", 0), kwargs.get("y", 0))
+                self.ctl.pointer.move_pointer(kwargs.get("x", 0), kwargs.get("y", 0))
                 continue
             if action == "__pointer_ensure__":
                 if self._pointer_on:
@@ -836,12 +836,12 @@ class Overlay(QWidget):
                 continue
             if action == "__hold_down__":
                 # 按住不放：DOWN + MOVE 心跳，等 __hold_up__ 才松手
-                ok, info = self.ctl.adb.hold_start(kwargs.get("fx", 0.5),
+                ok, info = self.ctl.pointer.hold_start(kwargs.get("fx", 0.5),
                                                    kwargs.get("fy", 0.5))
                 self.result_box[0] = (ok, "按住中（倍速）" if ok else info, None)
                 continue
             if action == "__hold_up__":
-                ok, info = self.ctl.adb.hold_stop()
+                ok, info = self.ctl.pointer.hold_stop()
                 self.result_box[0] = (True, "已松开" if ok else info, None)
                 continue
             try:
@@ -905,10 +905,10 @@ class Overlay(QWidget):
         self.holding = False
         self.hold_key = False
         try:
-            if self.ctl.adb.is_holding():
-                self.ctl.adb.hold_stop()
+            if self.ctl.pointer.is_holding():
+                self.ctl.pointer.hold_stop()
             else:
-                self.ctl.adb.press_up()
+                self.ctl.pointer.press_up()
         except Exception as exc:
             log("[overlay] 释放按住失败: %s" % exc)
 

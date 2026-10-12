@@ -43,7 +43,12 @@ public class CursorView {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.START;
-        wm.addView(new Overlay(), params);
+        try {
+            wm.addView(new Overlay(), params);
+        } catch (Exception exc) {
+            android.util.Log.e("PhoneCursor",
+                    "悬浮窗添加失败（是否已允许「显示在其他应用上层」？）", exc);
+        }
     }
 
     public void setSize(int w, int h) {
@@ -67,6 +72,13 @@ public class CursorView {
     private void refresh() {
         try {
             wm.updateViewLayout(current, params);
+        } catch (Exception exc) {
+            android.util.Log.w("PhoneCursor", "updateViewLayout 失败", exc);
+        }
+        // 关键：参数没变化时 updateViewLayout 不一定触发重绘，
+        // 必须显式 invalidate，否则光标移动了但屏幕上不刷新。
+        try {
+            current.invalidate();
         } catch (Exception ignore) {
         }
     }

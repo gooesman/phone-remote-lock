@@ -31,26 +31,17 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lock_phone import (  # noqa: E402
-    CONFIG_PATH, LOG_PATH, MODES, OVERLAY_SIZES, Controller, apply_mode,
-    default_config, load_config, log, save_config, set_overlay_size, tray_running,
+    MODES, OVERLAY_SIZES, Controller, apply_mode, default_config, load_config, log,
+    save_config, set_overlay_size, tray_running,
 )
-
-
-def _open_path(path):
-    try:
-        if os.name == "nt":
-            os.startfile(path)   # noqa
-    except Exception as exc:
-        log("打开 %s 失败: %s" % (path, exc))
 
 try:
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QAction, QFont, QKeySequence
+    from PySide6.QtGui import QFont, QKeySequence
     from PySide6.QtWidgets import (
-        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
+        QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
         QHBoxLayout, QHeaderView, QInputDialog, QKeySequenceEdit, QLabel,
-        QLineEdit, QMenu, QMessageBox, QPushButton, QTableWidget, QToolButton,
-        QVBoxLayout, QWidget,
+        QLineEdit, QMessageBox, QPushButton, QTableWidget, QVBoxLayout, QWidget,
     )
 except ImportError as exc:  # pragma: no cover
     sys.stderr.write("缺少 PySide6：.venv\\Scripts\\python.exe -m pip install PySide6\n%s\n" % exc)
@@ -104,6 +95,11 @@ SECTIONS = [
         ("任务切换", "app-switch", {}),
         ("通知栏", "key", {"keycode": 83}),
     ]),
+    ("应用", [
+        ("安装 APK…", "__install_apk__", {}),
+        ("卸载 APK…", "uninstall-apk", {}),
+        ("启动 App…", "launch-app", {}),
+    ]),
 ]
 
 STYLE = """
@@ -112,11 +108,6 @@ QLabel#title { font-size: 15px; font-weight: 500; color: #f0f0f0; }
 QLabel#dim { color: #8b8f96; font-size: 11px; }
 QLabel#status { color: #c3c8d0; font-size: 11px; }
 QLabel#sect { color: #7f858e; font-size: 11px; }
-QFrame#hintbox { background: rgba(74, 140, 224, 30); border: 1px solid rgba(74, 140, 224, 110);
-                 border-radius: 8px; }
-QPushButton#primary { background: #4a8ce0; color: #ffffff; font-weight: bold;
-                      border: 1px solid #6ba6ea; border-radius: 6px; padding: 6px 20px; }
-QPushButton#primary:hover { background: #5b9ceb; }
 QPushButton { background: #23262c; border: 1px solid #34383f; border-radius: 6px;
               padding: 6px 4px; min-height: 24px; }
 QPushButton:hover { background: #2d3138; }
@@ -473,14 +464,6 @@ class ControlPanel(QWidget):
         self.mode_box.setCurrentIndex(idx if idx >= 0 else 0)
         self.mode_box.currentIndexChanged.connect(self._on_mode_changed)
         top.addWidget(self.mode_box)
-
-        self.more_button = QToolButton()
-        self.more_button.setText("更多功能 ▾")
-        self.more_button.setPopupMode(QToolButton.InstantPopup)
-        self.more_button.setToolTip("安装 APK、映射层尺寸、手机鼠标光标、输入地址…这些不常用的都在这儿")
-        self.more_button.setMenu(self._build_more_menu())
-        top.addWidget(self.more_button)
-
         top.addStretch(1)
         root.addLayout(top)
 
@@ -490,7 +473,7 @@ class ControlPanel(QWidget):
         root.addWidget(self.mode_hint)
         self._refresh_mode_hint()
 
-        title = QLabel("手机遥控 · 控制面板")
+        title = QLabel("手机遥控")
         title.setObjectName("title")
         root.addWidget(title)
 
@@ -501,41 +484,6 @@ class ControlPanel(QWidget):
         self.bright_label = QLabel("亮度：读取中…")
         self.bright_label.setObjectName("dim")
         root.addWidget(self.bright_label)
-
-        # 顶部横幅：把"从哪开、怎么用"直接写在脸上
-        banner = QFrame()
-        banner.setObjectName("hintbox")
-        hb = QVBoxLayout(banner)
-        hb.setContentsMargins(10, 8, 10, 8)
-        hb.setSpacing(6)
-        hb.addWidget(QLabel("① 点「开始使用」开映射层　→　② 在映射层窗口里按住鼠标右键 = 操作手机"))
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-        self.start_button = QPushButton("开始使用")
-        self.start_button.setObjectName("primary")
-        self.start_button.setMinimumHeight(34)
-        self.start_button.setToolTip("一键完成：连手机 → 检查光标链路 → 打开映射层")
-        self.start_button.clicked.connect(self._start_everything)
-        btn_row.addWidget(self.start_button)
-
-        self.backend_button = QPushButton("手机光标")
-        self.backend_button.setCheckable(True)
-        self.backend_button.setToolTip(
-            "开启：鼠标事件发给手机上的「手机光标」App（手机上有可见光标）\n"
-            "关闭：用 adb 注入（手机上没有光标，但兼容性最好）")
-        self.backend_button.setChecked(
-            (self.host.cfg.get("pointer_backend") or "adb").lower() == "net")
-        self.backend_button.clicked.connect(self._toggle_backend)
-        btn_row.addWidget(self.backend_button)
-
-        self.help_label = QLabel("")
-        self.help_label.setObjectName("dim")
-        self.help_label.setWordWrap(True)
-        btn_row.addWidget(self.help_label, 1)
-        hb.addLayout(btn_row)
-        root.addWidget(banner)
-        self._refresh_help()
 
         for name, items in SECTIONS:
             caption = QLabel(name)
@@ -570,6 +518,23 @@ class ControlPanel(QWidget):
         self.overlay_button.clicked.connect(self.host.toggle_overlay)
         row.addWidget(self.overlay_button)
 
+        self.mouse_button = QPushButton("手机鼠标光标")
+        self.mouse_button.setObjectName("wide")
+        self.mouse_button.setCheckable(True)
+        self.mouse_button.setChecked(self.host.ctl.adb.is_mouse_mode())
+        self.mouse_button.setToolTip("开启后：手机把注入当鼠标用，屏幕上会出现系统鼠标光标\n"
+                                     "（映射层里移动鼠标=光标跟随，不需要蓝牙鼠标）")
+        self.mouse_button.clicked.connect(self._toggle_mouse_mode)
+        row.addWidget(self.mouse_button)
+
+        for key, label in OVERLAY_SIZES:
+            size_btn = QPushButton(label)
+            size_btn.setMaximumWidth(44)
+            size_btn.setToolTip("映射层窗口大小：%s（一键，自动保持手机比例）" % label)
+            size_btn.clicked.connect(
+                lambda _=False, k=key: self._set_overlay_size(k))
+            row.addWidget(size_btn)
+
         refresh = QPushButton("刷新状态")
         refresh.setObjectName("wide")
         refresh.clicked.connect(lambda: self.host.fire("__state__"))
@@ -580,6 +545,10 @@ class ControlPanel(QWidget):
         reconnect.clicked.connect(lambda: self.host.fire("connect"))
         row.addWidget(reconnect)
 
+        manual = QPushButton("输入地址连接")
+        manual.setObjectName("wide")
+        manual.clicked.connect(self._ask_addr)
+        row.addWidget(manual)
         root.addLayout(row)
 
         self.status_label = QLabel("就绪")
@@ -591,55 +560,6 @@ class ControlPanel(QWidget):
         hint.setObjectName("dim")
         hint.setWordWrap(True)
         root.addWidget(hint)
-
-    def _build_more_menu(self):
-        """标题栏「更多功能」：不常用的东西都收进来，主面板只留高频操作。"""
-        menu = QMenu(self)
-
-        app_menu = menu.addMenu("应用 / APK")
-        act = QAction("安装 APK…", self)
-        act.setToolTip("选一个 .apk 装到手机上（也可以把 apk 拖到 install_apk.bat）")
-        act.triggered.connect(self._pick_apk)
-        app_menu.addAction(act)
-        act = QAction("卸载 APK…", self)
-        act.triggered.connect(self._ask_uninstall)
-        app_menu.addAction(act)
-        act = QAction("启动 App…", self)
-        act.triggered.connect(self._ask_launch)
-        app_menu.addAction(act)
-        app_menu.addSeparator()
-        act = QAction("安装上次的 APK", self)
-        act.setEnabled(bool(self.host.cfg.get("last_apk")))
-        act.triggered.connect(lambda: self.host.fire(
-            "install-apk", path=self.host.cfg.get("last_apk") or ""))
-        app_menu.addAction(act)
-
-        size_menu = menu.addMenu("映射层大小")
-        for key, label in OVERLAY_SIZES:
-            act = QAction(label, self)
-            act.setCheckable(True)
-            act.setChecked((self.host.cfg.get("overlay_size_preset") or "") == key)
-            act.triggered.connect(lambda _=False, k=key: self._set_overlay_size(k))
-            size_menu.addAction(act)
-
-        menu.addSeparator()
-        self.mouse_action = QAction("手机鼠标光标（鼠标源注入）", self)
-        self.mouse_action.setCheckable(True)
-        self.mouse_action.setChecked(self.host.ctl.adb.is_mouse_mode())
-        self.mouse_action.triggered.connect(self._toggle_mouse_mode)
-        menu.addAction(self.mouse_action)
-
-        menu.addSeparator()
-        act = QAction("输入地址连接手机…", self)
-        act.triggered.connect(self._ask_addr)
-        menu.addAction(act)
-        act = QAction("打开配置文件", self)
-        act.triggered.connect(lambda: _open_path(CONFIG_PATH))
-        menu.addAction(act)
-        act = QAction("打开日志", self)
-        act.triggered.connect(lambda: _open_path(LOG_PATH))
-        menu.addAction(act)
-        return menu
 
     def _refresh_mode_hint(self):
         key = self.host.cfg.get("mode") or "bili-portrait"
@@ -658,60 +578,17 @@ class ControlPanel(QWidget):
         self.host.ctl = Controller(self.host.cfg)
         self.set_status("%s（快捷键/按钮已按该模式生效）" % info)
 
-    def _refresh_help(self):
-        backend = (self.host.cfg.get("pointer_backend") or "adb").lower()
-        phone_ip = self.host.cfg.get("net_host") or "未设置"
-        if backend == "net":
-            self.help_label.setText("当前：手机光标模式（手机 IP %s）" % phone_ip)
-        else:
-            self.help_label.setText("当前：adb 注入（手机上没有光标）")
-
-    def _toggle_backend(self, checked=None):
-        want = "net" if self.backend_button.isChecked() else "adb"
-        if want == "net" and not (self.host.cfg.get("net_host") or "").strip():
-            self.set_status("还没填手机 IP：跑 python lock_phone.py doctor 能看到地址，"
-                            "填到 config.json 的 net_host 再切")
-            self.backend_button.setChecked(False)
-            return
-        ok, info = self.host.ctl.run_action("pointer-backend", value=want)
-        self.set_status(info)
-        self.backend_button.setChecked(
-            (self.host.cfg.get("pointer_backend") or "adb").lower() == "net")
-        self._refresh_help()
-
-    def _start_everything(self):
-        """一键开始：连手机 → 试光标链路 → 打开映射层。"""
-        ok, info = self.host.ctl.adb.ensure()
-        self.set_status(("已连手机：" if ok else "连手机失败：") + info)
-        ptr = self.host.ctl.pointer
-        if ptr is not self.host.ctl.adb:
-            alive, msg = ptr.status()
-            self.set_status("手机光标链路：" + ("正常（%s）" % msg if alive else msg))
-        if self.host.overlay is not None and self.host.overlay.isVisible():
-            self.set_status("映射层已经开着 —— 在窗口里按住鼠标右键即可操作手机")
-            return
-        self.host.toggle_overlay()
-        self.set_status("映射层已打开：在窗口里按住鼠标右键开始操作手机"
-                        "（移动=光标跟随，左键=点击/拖动，滚轮=上下视频，Esc=关闭）")
-
     def _set_overlay_size(self, key):
         ok, info = set_overlay_size(self.host.cfg, key)
         self.set_status(info)
-        try:
-            self.more_button.setMenu(self._build_more_menu())   # 刷新勾选状态
-        except Exception:
-            pass
 
-    def _toggle_mouse_mode(self, checked=None):
-        # Qt 对 checkable QAction 的 triggered 传的是"翻转后"的状态，容易搞反，
-        # 干脆按"当前真实状态取反"来切换，最后再用真实状态纠正菜单勾选。
-        want = not self.host.ctl.adb.is_mouse_mode()
+    def _toggle_mouse_mode(self):
+        want = self.mouse_button.isChecked()
         ok, info = self.host.ctl.run_action("set-input-source",
                                            value="mouse" if want else "touchscreen")
         self.host.cfg["input_source"] = self.host.ctl.adb.input_source()
         save_config(self.host.cfg)
-        if getattr(self, "mouse_action", None) is not None:
-            self.mouse_action.setChecked(self.host.ctl.adb.is_mouse_mode())
+        self.mouse_button.setChecked(self.host.ctl.adb.is_mouse_mode())
         self.set_status(info)
 
     def _pick_apk(self):
@@ -784,15 +661,6 @@ class ControlPanel(QWidget):
         self.overlay_button.setChecked(bool(on))
         self.overlay_button.setText("关闭映射层" if on else "开启映射层")
 
-    def keyPressEvent(self, event):
-        # Esc = 关闭映射层；不要关控制面板（面板是常驻的，关掉窗口只是隐藏）
-        if event.key() == Qt.Key_Escape:
-            if self.host.overlay is not None and self.host.overlay.isVisible():
-                self.host.fire("overlay-off")
-                self.set_status("已关闭映射层（面板留着）")
-            return
-        super().keyPressEvent(event)
-
     def closeEvent(self, event):
         event.ignore()
         self.hide()
@@ -860,23 +728,15 @@ class PanelHost(object):
 
     # -- Qt 操作（只在主线程执行） --------------------------------
 
-    def _overlay_closed(self):
-        """映射层被关掉（按 Esc / 点关闭）时同步按钮状态，但**不动面板**。"""
-        self.window.set_overlay_state(False)
-        log("[panel] 映射层已关闭（面板继续留着）")
-
     def _do_overlay_on(self):
         if self.overlay is None:
             try:
-                # standalone=False：它和面板在同一个进程里，关掉它绝不能退出整个进程
-                self.overlay = overlay_mod.Overlay(self.cfg, on_close=self._overlay_closed,
-                                                   standalone=False)
-                overlay_mod.apply_saved_geometry(self.overlay, self.cfg)
+                self.overlay = overlay_mod.Overlay(self.cfg)
             except Exception as exc:
                 log("[panel] 创建映射层失败: %s" % exc)
                 return False, "创建映射层失败：%s" % exc
         try:
-            self.overlay.show()
+            self.overlay.showFullScreen()
             self.overlay.raise_()
             self.overlay.activateWindow()
             self.overlay.setFocus()

@@ -21,3 +21,5 @@ Desktop.ini
 # Android 构建产物（APK/中间文件/调试密钥都不入库，用 android/build_apk.py 现编）
 android/app/build/
 android/debug.keystore
+_*.png
+dot_test.png

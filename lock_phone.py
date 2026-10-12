@@ -1325,8 +1325,9 @@ class Adb(object):
         text = output or ""
         table = [
             ("INSTALL_FAILED_USER_RESTRICTED",
-             "手机限制了 USB 安装。小米/HyperOS：开发者选项 → 打开「USB 安装」"
-             "（部分机型要登录小米账号 + 插 SIM 卡才给开）"),
+             "手机系统限制了安装。小米/HyperOS：开发者选项 → 打开「USB 安装（安全设置）」"
+             "（通常要求插 SIM 卡 + 登录小米账号）；"
+             "另一条路：把 apk 放到手机 Download 目录，在手机上手动点一下安装"),
             ("INSTALL_FAILED_UPDATE_INCOMPATIBLE",
              "签名不一致：手机上装过同包名但签名不同的版本，先卸载它再装"
              "（用「卸载 APK」按钮或 adb uninstall <包名>）"),
@@ -1347,6 +1348,13 @@ class Adb(object):
             if key in text:
                 return tip
         return ""
+
+    @staticmethod
+    def _worth_retry_with_push(output):
+        """传输类错误一定要重试；用户限制也值得试一次（有的 ROM 只挡安装器 UI）。"""
+        if Adb._transport_error(output):
+            return True
+        return "INSTALL_FAILED_USER_RESTRICTED" in (output or "")
 
     @staticmethod
     def _transport_error(output):
@@ -1372,7 +1380,10 @@ class Adb(object):
         ok, info = self.ready()
         if not ok:
             return False, info
-        path = os.path.abspath(os.path.expanduser(str(path or "").strip('"')))
+        path = str(path or "").strip().strip('"')
+        if not path:
+            return False, "没给 APK 路径（把 apk 拖到 install_apk.bat 上，或命令行带上路径）"
+        path = os.path.abspath(os.path.expanduser(path))
         if not os.path.isfile(path):
             return False, "找不到文件：%s" % path
         if not path.lower().endswith(".apk"):
@@ -1386,11 +1397,12 @@ class Adb(object):
 
         before = self.list_third_party()
         flags = self._install_flags(replace=replace, grant=grant)
-        code, out = self._exec(["install"] + flags + [path], timeout=timeout)
+        code, out = self._exec(["-s", self.target, "install"] + flags + [path],
+                             timeout=timeout)
         text = (out or "").strip()
         success = (code == 0 and "Success" in text)
 
-        if not success and push_fallback and self._transport_error(text):
+        if not success and push_fallback and self._worth_retry_with_push(text):
             log("[apk] 传输类失败，改走 push + pm install：%s" % text[:120])
             pushed = self._install_via_push(path, grant, timeout)
             if pushed[0]:
@@ -1401,6 +1413,16 @@ class Adb(object):
             log("[apk] 非传输类失败，不重试：%s" % text[:120])
 
         if not success:
+            if "INSTALL_FAILED_USER_RESTRICTED" in text:
+                try:                      # 至少让用户能在手机上直接点安装
+                    self._exec(["-s", self.target, "push", path,
+                                "/sdcard/Download/" + os.path.basename(path)], timeout=120)
+                    self._shell(["am", "broadcast", "-a",
+                                 "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                                 "-d", "file:///sdcard/Download/" + os.path.basename(path)],
+                                timeout=30)
+                except Exception:
+                    pass
             hint = self._install_hint(text)
             msg = "安装失败：%s" % (text[-400:] or "adb 没有返回原因")
             if hint:
@@ -1417,7 +1439,7 @@ class Adb(object):
     def _install_via_push(self, path, grant, timeout):
         """先 push 到 /data/local/tmp 再用 pm install —— 无线 adb 不稳时的备选。"""
         remote = "/data/local/tmp/_push_install.apk"
-        code, out = self._exec(["push", path, remote], timeout=timeout)
+        code, out = self._exec(["-s", self.target, "push", path, remote], timeout=timeout)
         if code != 0:
             return False, "push 失败：%s" % (out or "").strip()[-200:]
         flags = self._install_flags(grant=grant)
@@ -2459,7 +2481,7 @@ def _exec_raw(args, timeout=12):
         return -1, ""
 
 
-def apply_mode(cfg, mode):
+def _open_install_console():
     """在新控制台里跑「安装 APK」引导（托盘菜单用）。"""
     exe = sys.executable or ""
     if exe.lower().endswith("pythonw.exe"):
@@ -2800,7 +2822,7 @@ def main(argv):
         "app-vol-up": {}, "app-vol-down": {}, "unlock": {}, "like": {},
         "speed-on": {}, "speed-off": {}, "speed-toggle": {}, "long-press-once": {},
         "seek-forward": {}, "seek-back": {}, "next-video": {},
-        "install-apk": {}, "uninstall-apk": {}, "launch-app": {},
+        "launch-app": {},
         "mouse-mode": {}, "overlay-size": {},
         "bright-get": {}, "panel": {}, "overlay-on": {}, "overlay-off": {},
         "overlay-toggle": {}, "doctor": {}, "dot-test": {},
@@ -2821,11 +2843,6 @@ def main(argv):
         ok, info = set_overlay_size(cfg, name)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 2
-
-    if action in simple:
-        ok, info = ctl.run_action(action)
-        say(("OK   " if ok else "FAIL ") + info)
-        return 0 if ok else 1
 
     if action in ("install-apk", "install"):
         path = argv[2] if len(argv) > 2 else ""
@@ -2862,6 +2879,11 @@ def main(argv):
         if not pkg:
             pkg = _ask("   要启动的包名: ") or ""
         ok, info = ctl.run_action("launch-app", package=pkg)
+        say(("OK   " if ok else "FAIL ") + info)
+        return 0 if ok else 1
+
+    if action in simple:
+        ok, info = ctl.run_action(action)
         say(("OK   " if ok else "FAIL ") + info)
         return 0 if ok else 1
 

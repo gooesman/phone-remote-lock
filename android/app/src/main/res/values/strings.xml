@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">手机光标</string>
+    <string name="accessibility_service_id">com.gooesman.phonecursor/com.gooesman.phonecursor.CursorService</string>
+</resources>

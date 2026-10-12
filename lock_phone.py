@@ -293,6 +293,9 @@ def default_config():
         "retry_cooldown": 4.0,
         "ensure_ttl": 5,
         "input_source": "touchscreen",
+        "pointer_backend": "adb",
+        "net_host": "",
+        "net_port": 4321,
         "overlay_move_rate": 20,
         "apk_grant_permissions": True,
         "apk_push_fallback": True,
@@ -1751,14 +1754,45 @@ KEYEVENTS = {
 
 
 class Controller(object):
+    """动作分发。
+
+    `pointer` 是"指针后端"：默认就是 adb（注入事件，手机上没有光标）；
+    配了 `pointer_backend="net"` 时换成 NetPointer —— 把操作发给手机上的
+    「手机光标」App（它自己画光标 + 用无障碍服务执行手势）。
+    除指针外的动作（亮度、锁屏、装 APK…）永远走 adb。
+    """
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.adb = Adb(cfg)
+        self._pointer = None
 
     # -- 模式 ------------------------------------------------------
 
     def mode(self):
         return (self.cfg.get("mode") or "bili-portrait").strip()
+
+    @property
+    def pointer(self):
+        if self._pointer is None:
+            if (self.cfg.get("pointer_backend") or "adb").strip().lower() == "net":
+                try:
+                    from net_pointer import NetPointer
+                    self._pointer = NetPointer(self.cfg)
+                except Exception as exc:
+                    log("NetPointer 不可用，改用 adb：%s" % exc)
+                    self._pointer = self.adb
+            else:
+                self._pointer = self.adb
+        return self._pointer
+
+    def reset_pointer(self):
+        if self._pointer is not None and self._pointer is not self.adb:
+            try:
+                self._pointer.close_channel("切换后端")
+            except Exception:
+                pass
+        self._pointer = None
 
     def mode_info(self):
         return MODES.get(self.mode()) or MODES["bili-portrait"]
@@ -1777,12 +1811,12 @@ class Controller(object):
         adb = self.adb
         if kind == "swipe":
             path = spec.get("path") or [0.5, 0.8, 0.5, 0.25]
-            ok, info = adb.swipe_ratio(*path, duration=spec.get("duration", 180))
+            ok, info = self.pointer.swipe_ratio(*path, duration=spec.get("duration", 180))
             return (True, "已滑动 %s" % ("→".join("%.2f" % v for v in path))) if ok else (ok, info)
         if kind == "tap":
-            return adb.tap_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5))
+            return self.pointer.tap_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5))
         if kind == "double-tap":
-            return adb.double_tap_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5))
+            return self.pointer.double_tap_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5))
         if kind == "long-press":
             return adb.long_press_ratio(spec.get("fx", 0.5), spec.get("fy", 0.5),
                                         spec.get("ms", self.cfg.get("long_press_hold_ms", 1200)))
@@ -1819,7 +1853,7 @@ class Controller(object):
         if name == "key":
             return self.adb.send_keyevent(kwargs.get("keycode"))
         if name == "next":
-            return self.adb.swipe_ratio(0.5, 0.80, 0.5, 0.25, self.cfg.get("swipe_duration", 160))
+            return self.pointer.swipe_ratio(0.5, 0.80, 0.5, 0.25, self.cfg.get("swipe_duration", 160))
         if name == "prev":
             return self.adb.swipe_ratio(0.5, 0.25, 0.5, 0.80, self.cfg.get("swipe_duration", 160))
         if name in ("long-press", "speed"):
@@ -1841,13 +1875,13 @@ class Controller(object):
             if "fx" in kwargs or "fy" in kwargs:
                 fx = kwargs.get("fx", fx)
                 fy = kwargs.get("fy", fy)
-            ok, info = self.adb.hold_start(fx, fy)
+            ok, info = self.pointer.hold_start(fx, fy)
             if ok:
                 return True, ("倍速已开（按住中）· 再按一次关闭｜%s"
                               % self.mode_info().get("speed_note", ""))
             return ok, info
         if name in ("like", "double-tap"):
-            return self.adb.double_tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
+            return self.pointer.double_tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
         if name in ("seek-forward", "seek-back"):
             if name == "seek-forward":
                 return self.adb.swipe_ratio(0.35, 0.5, 0.75, 0.5, 180)
@@ -1864,6 +1898,29 @@ class Controller(object):
             return self.adb.uninstall_package(kwargs.get("package") or kwargs.get("pkg"))
         if name in ("launch-app", "launch"):
             return self.adb.launch_package(kwargs.get("package") or kwargs.get("pkg"))
+        if name in ("pointer-backend", "input-backend"):
+            backend = (kwargs.get("value") or "").strip().lower()
+            if backend not in ("adb", "net"):
+                return False, "只支持 adb / net"
+            self.cfg["pointer_backend"] = backend
+            save_config(self.cfg)
+            self.reset_pointer()
+            if backend == "net":
+                return True, "指针已切到「网络后端」：需要手机开着「手机光标」App（net_host=%s）" % (
+                    self.cfg.get("net_host") or "未设置")
+            return True, "指针已切回 adb 注入（手机上没有光标）"
+        if name == "pointer-status":
+            ptr = self.pointer
+            if ptr is self.adb:
+                ok, info = self.adb.ensure()
+                return ok, "当前后端：adb 注入（%s）" % info
+            ok, info = ptr.status()
+            return ok, "当前后端：网络（%s）" % info
+        if name == "cursor-visibility":
+            ptr = self.pointer
+            if ptr is self.adb:
+                return False, "只有网络后端（手机光标 App）才能控制手机上的光标"
+            return ptr.show_cursor(bool(kwargs.get("value", True)))
         if name == "overlay-size":
             return set_overlay_size(self.cfg, kwargs.get("value"))
         if name in ("set-input-source", "mouse-mode"):
@@ -1885,7 +1942,7 @@ class Controller(object):
             return self.adb.scroll(kwargs.get("x", 0), kwargs.get("y", 0),
                                    kwargs.get("amount", 3))
         if name in ("tap-xy",):
-            return self.adb.tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
+            return self.pointer.tap_ratio(kwargs.get("fx", 0.5), kwargs.get("fy", 0.5))
         if name == "bright-up":
             return self.adb.brightness_key(+1, self.cfg.get("brightness_key_repeat", 1))
         if name == "bright-down":
